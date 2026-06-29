@@ -188,6 +188,23 @@ def test_attempt_permute_preserves_bare_tensor():
     assert out is big
 
 
+def test_attempt_permute_accepts_arbitrary_strided_view():
+    """CudaIPC carries shape, stride, and storage_offset; do not reject a
+    metadata-only strided view just because it is not dim-0 padded."""
+    base = torch.arange(64, dtype=torch.float32, device="cuda")
+    view = base[1:20:3]
+    assert not view.is_contiguous()
+    assert view.storage_offset() != 0
+
+    out = attempt_permute_to_contiguous_view(view)
+
+    assert out.shape == view.shape
+    assert out.stride() == view.stride()
+    assert out.storage_offset() == view.storage_offset()
+    assert out.data_ptr() == view.data_ptr()
+    torch.testing.assert_close(out, view)
+
+
 def test_attempt_permute_recurses_all_shapes():
     """attempt_permute_to_contiguous_view must descend into every
     DiscoverableKVCache shape and permute non-contiguous tensor leaves."""

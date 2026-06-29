@@ -125,20 +125,13 @@ def attempt_permute_to_contiguous_view(
         result = kv_caches.permute(perm)
         if result.is_contiguous():
             return result
-        # Non-permute non-contiguity: only the strict dim-0-padding pattern
-        # is recoverable downstream. Delegate validation + diagnostics to
-        # the helper; on success we keep the stride-sorted view as-is and
-        # rely on ``PageBufferShapeDesc.block_stride_elems`` to honour the
-        # padding.
-        padding_per_block = _validate_dim0_padded_layout(result)
         logger.debug(
-            "attempt_permute_to_contiguous_view: accepting dim-0-padded "
-            "view; downstream kernels must honour block_stride_elems. "
-            "shape=%s, stride=%s, padding_per_block_elems=%d, "
-            "storage_nbytes=%s, dtype=%s",
+            "attempt_permute_to_contiguous_view: accepting strided view; "
+            "CudaIPC carries shape/stride/storage_offset. shape=%s, "
+            "stride=%s, storage_offset=%d, storage_nbytes=%s, dtype=%s",
             tuple(result.shape),
             tuple(result.stride()),
-            padding_per_block,
+            int(result.storage_offset()),
             int(result.untyped_storage().nbytes()),
             result.dtype,
         )
