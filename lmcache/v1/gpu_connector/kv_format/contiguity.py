@@ -57,91 +57,15 @@ def attempt_permute_to_contiguous_view(
         result = kv_caches.permute(perm)
         if result.is_contiguous():
             return result
-        padding_per_block = _validate_dim0_padded_layout(result)
         logger.debug(
-            "attempt_permute_to_contiguous_view: accepting dim-0-padded "
-            "view; downstream kernels must honour block_stride_elems. "
-            "shape=%s, stride=%s, padding_per_block_elems=%d, "
-            "storage_nbytes=%s, dtype=%s",
+            "attempt_permute_to_contiguous_view: accepting strided view; "
+            "CudaIPC carries shape/stride/storage_offset. shape=%s, "
+            "stride=%s, storage_offset=%d, storage_nbytes=%s, dtype=%s",
             tuple(result.shape),
             tuple(result.stride()),
-            padding_per_block,
+            int(result.storage_offset()),
             int(result.untyped_storage().nbytes()),
             result.dtype,
         )
         return result
     return [attempt_permute_to_contiguous_view(sub) for sub in kv_caches]
-
-
-def _validate_dim0_padded_layout(tensor: torch.Tensor) -> int:
-    """Validate that *tensor* matches the dim-0-padding-only strided layout.
-
-    Mainly used for DeepSeek V4 integration, where compressor / indexer
-    KV groups share a pool with larger attn groups and end up with
-    per-block dim-0 padding. The downstream KV transfer kernels only
-    honour this single non-contiguous shape (via
-    :class:`PageBufferShapeDesc.block_stride_elems`); any other strided
-    view would cause wrong reads/writes and is rejected here.
-
-    The accepted layout requires:
-
-    * ``stride[-1] == 1`` and ``stride[-2] == shape[-1]`` -- each block
-      row is internally tightly packed.
-    * Every interior dim ``i`` satisfies
-      ``stride[i] == prod(shape[i+1:])`` -- only dim-0 may carry
-      padding, with ``stride[0] >= prod(shape[1:])``.
-    * ``storage_offset == 0`` -- no slice/narrow base shift.
-
-    Callers must pass the stride-sorted permuted view (not the original
-    tensor): for tensors that are both permuted and dim-0-padded, the
-    original's unsorted inner strides would falsely trip the tight-
-    packing check. ``permute`` shares storage and preserves
-    ``storage_offset``/``numel``/storage bytes, so those checks are
-    equivalent on either view.
-
-    Returns:
-        ``padding_per_block_elems`` (= ``stride[0] - prod(shape[1:])``).
-
-    Raises:
-        ValueError: *tensor* violates any of the invariants above.
-    """
-    shape = tuple(tensor.shape)
-    stride = tuple(tensor.stride())
-    ndim = tensor.ndim
-    storage_offset = int(tensor.storage_offset())
-
-    def _fail(reason: str) -> None:
-        raise ValueError(
-            "attempt_permute_to_contiguous_view: tensor is non-contiguous "
-            f"and not a supported (dim-0 padding only) layout -- {reason}. "
-            f"shape={shape}, stride={stride}, "
-            f"storage_offset={storage_offset}, numel={int(tensor.numel())}, "
-            f"storage_nbytes={int(tensor.untyped_storage().nbytes())}, "
-            f"dtype={tensor.dtype}. "
-            "Downstream KV transfer kernels only understand dim-0 "
-            "block-row padding; other strided views would produce "
-            "wrong reads/writes and are rejected."
-        )
-
-    if ndim < 2:
-        _fail("ndim < 2")
-    if stride[-1] != 1:
-        _fail("stride[-1] != 1 (inner dim not contiguous)")
-    if stride[-2] != shape[-1]:
-        _fail("stride[-2] != shape[-1] (last-two dims not tightly packed)")
-    if storage_offset != 0:
-        _fail("storage_offset != 0 (slice/narrow view, base address shifted)")
-    inner_tight = 1
-    for i in range(ndim - 1, 0, -1):
-        if i < ndim - 1 and stride[i] != inner_tight:
-            _fail(
-                f"dim {i} stride {stride[i]} != tight {inner_tight} "
-                "(interior-dim padding is not supported)"
-            )
-        inner_tight *= shape[i]
-    if stride[0] < inner_tight:
-        _fail(
-            f"dim-0 stride {stride[0]} < prod(shape[1:])={inner_tight} "
-            "(overlapping blocks)"
-        )
-    return stride[0] - inner_tight
