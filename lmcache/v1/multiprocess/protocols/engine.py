@@ -109,6 +109,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 EngineType,
                 LayoutHints,
                 list[EngineGroupInfo],
+                int,  # KV worker id; -1 for legacy rank-less callers
             ],
             response_class=None,
             handler_type=HandlerType.SYNC,

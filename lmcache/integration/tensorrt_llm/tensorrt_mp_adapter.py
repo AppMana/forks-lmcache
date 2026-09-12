@@ -369,6 +369,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 EngineType.TRTLLM,
                 layout_hints,
                 [],
+                -1,
             ],
         )
         try:

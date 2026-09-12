@@ -22,6 +22,7 @@ from lmcache.utils import (
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
+    TrimPolicy,
 )
 from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_d2h,
@@ -411,6 +412,7 @@ class ContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    kv_rank: int | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -550,7 +552,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             entry: The entry removed from the registry.
         """
         entry.cache_context.close()
-        self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
+        if entry.kv_rank is None:
+            self._ctx.layout_desc_registry.unregister(
+                entry.model_name, entry.world_size
+            )
+        else:
+            self._ctx.layout_desc_registry.unregister(
+                entry.model_name, entry.world_size, kv_rank=entry.kv_rank
+            )
         torch_dev.empty_cache()
 
     def get_handlers(self) -> list[HandlerSpec]:
@@ -630,6 +639,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
+        worker_id: int = -1,
     ) -> None:
         """Register the KV cache tensors for a given GPU instance ID.
 
@@ -639,6 +649,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 serving engine.
             model_name: The name of the model associated with this KV cache.
             world_size: The world size associated with this KV cache.
+            worker_id: KV worker index, or -1 for legacy rank-less clients.
             engine_type: Which serving engine produced the caches.
                 Forwarded to GPUCacheContext for format detection.
             layout_hints: See LayoutHints.  Forwarded to
@@ -677,12 +688,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ]
         layout_desc = group_layout_descs[0]
         attn_desc = kv_groups_manager.get_attn_desc()
+        kv_rank = (
+            ObjectKey.ComputeKVRank(world_size, worker_id, world_size, worker_id)
+            if worker_id >= 0
+            else None
+        )
         self._ctx.layout_desc_registry.register(
             model_name,
             world_size,
             layout_desc,
             attn_desc,
             group_layout_descs=group_layout_descs,
+            kv_rank=kv_rank,
         )
 
         with self._lock:
@@ -690,6 +707,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 cache_context=cache_context,
                 model_name=model_name,
                 world_size=world_size,
+                kv_rank=kv_rank,
                 last_seen=now,
                 has_liveness_signal=False,
             )
@@ -1031,6 +1049,35 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 )
                 event.record()
                 return event.ipc_handle(), False
+
+            # Only the scheduler's sidecar receives LOOKUP. Other pipeline
+            # sidecars must acquire their own local read locks and load L2
+            # misses using their registered object-group layouts.
+            session = self._ctx.session_manager.get_or_create(key.request_id)
+            if session.lookup_ipc_key is None:
+                local_keys = [k for group in obj_keys_per_obj_group for k in group]
+                layouts = self._ctx.layout_desc_registry.find_group_layout_descs(
+                    key.model_name, key.world_size
+                )
+                handle = self._ctx.storage_manager.submit_prefetch_task(
+                    local_keys,
+                    layouts[0],
+                    external_request_id=key.request_id,
+                    policy=TrimPolicy.SPARSE,
+                    group_layout_descs=layouts,
+                )
+                # The storage controller owns adapter deadlines. Consume its
+                # completion even on a failed load so partial locks are freed.
+                while not self._ctx.storage_manager.wait_prefetch_status(handle, 1.0):
+                    pass
+                found = self._ctx.storage_manager.query_prefetch_status(handle)
+                if found is None or found.popcount() != len(local_keys):
+                    if found is not None:
+                        self._ctx.storage_manager.finish_read_prefetched(
+                            found.gather(local_keys)
+                        )
+                    event.record()
+                    return event.ipc_handle(), False
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(

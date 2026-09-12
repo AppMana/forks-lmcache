@@ -427,7 +427,8 @@ class StorageManager:
                 loaded and an empty handle is returned.
             mode: The prefetch intent (see :class:`PrefetchMode`).  ``WARM``
                 retains loaded keys and pins none; ``LOOKUP`` (default) pins
-                them for an imminent reader and follows the policy.
+                them for an imminent reader and follows the policy. ``EXISTS``
+                checks L2 only and holds no L1 buffers or locks.
             group_layout_descs: Memory layout of every object group, in
                 object-group order; each key's L1 buffer follows its own
                 group's layout. None means every key follows ``layout_desc``.
@@ -435,8 +436,9 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
-        if mode is PrefetchMode.WARM:
-            # Warm path: load all keys, pin none. skip_l2 makes it a no-op.
+        if mode in (PrefetchMode.WARM, PrefetchMode.EXISTS):
+            # WARM loads unpinned data; EXISTS checks L2 without loading.
+            # Neither mode reserves reads in L1. skip_l2 makes both a no-op.
             prefetch_request_id = -1
             if not skip_l2 and keys and self._l2_adapters:
                 prefetch_request_id = self._prefetch_controller.submit_prefetch_request(

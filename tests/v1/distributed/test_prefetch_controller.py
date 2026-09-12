@@ -1565,3 +1565,34 @@ class TestObjectGroupLayouts:
         finally:
             ctrl.stop()
             adapter.close()
+
+
+def test_exists_checks_foreign_layout_without_loading_or_leaking_locks(l1_manager):
+    """Presence does not depend on this rank's different object sizes."""
+    adapter = make_adapter()
+    keys = [make_object_key(i) for i in range(3)]
+    store_keys_in_l2(adapter, keys, make_layout())
+    foreign_layout = MemoryLayoutDesc(shapes=[torch.Size([1])], dtypes=[torch.uint8])
+    ctrl = PrefetchController(
+        l1_manager=l1_manager,
+        l2_adapters=[adapter],
+        adapter_descriptors=[make_descriptor(0)],
+        policy=DefaultPrefetchPolicy(),
+    )
+    ctrl.start()
+    try:
+        req_id = ctrl.submit_prefetch_request(
+            keys, foreign_layout, mode=PrefetchMode.EXISTS
+        )
+        assert wait_for_prefetch_result(ctrl, req_id) == 3
+        assert all(
+            v[0] == L1Error.KEY_NOT_EXIST
+            for v in l1_manager.reserve_read(keys).values()
+        )
+        # A subsequent normal load still works after EXISTS releases L2 locks.
+        req_id = ctrl.submit_prefetch_request(keys, make_layout())
+        assert wait_for_prefetch_result(ctrl, req_id) == 3
+        l1_manager.finish_read(keys)
+    finally:
+        ctrl.stop()
+        adapter.close()

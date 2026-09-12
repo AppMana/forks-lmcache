@@ -94,6 +94,7 @@ def test_server_free_lookup_locks_calls_finish_read_prefetched():
     from lmcache.v1.multiprocess.modules.lookup import LookupModule
 
     ctx = MagicMock()
+    ctx.layout_desc_registry.find_kv_ranks.return_value = set()
     ctx.token_hasher.chunk_size = 256
     ctx.token_hasher.compute_chunk_hashes.return_value = [b"hash0"]
 

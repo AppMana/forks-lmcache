@@ -131,6 +131,7 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        worker_id: int = -1,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -145,6 +146,7 @@ class TransferContext(ABC):
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            worker_id: KV worker index, or -1 for legacy rank-less callers.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -242,6 +244,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        worker_id: int = -1,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
@@ -259,6 +262,7 @@ class LMCacheDrivenTransferContext(TransferContext):
                 EngineType.VLLM,
                 layout_hints,
                 list(engine_group_infos),
+                worker_id,
             ],
         )
         future.result(timeout=mq_timeout)
@@ -349,6 +353,7 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        worker_id: int = -1,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 

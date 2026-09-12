@@ -2,16 +2,19 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchHandle,
+    PrefetchMode,
+    TrimPolicy,
     ipc_key_to_object_keys,
 )
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -123,6 +126,13 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    foreign_handle: PrefetchHandle | None = None
+    foreign_ranks: int = 0
+    local_keys: list[ObjectKey] = field(default_factory=list)
+    extra_count: int = 0
+    local_found: Bitmap | None = None
+    foreign_found: Bitmap | None = None
+    poll_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class LookupModule:
@@ -211,6 +221,7 @@ class LookupModule:
         """Submit a prefix lookup.
 
         Hashes the key, submits a prefetch task to the storage manager,
+        checks foreign ranks on L2 without loading their different layouts,
         and registers the job under ``key.request_id`` for later polling
         via query_prefetch_status.
 
@@ -319,19 +330,43 @@ class LookupModule:
             model_name, world_size
         )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
+        local_ranks = self._ctx.layout_desc_registry.find_kv_ranks(
+            model_name, world_size
+        )
+        local_keys = [
+            k for k in obj_keys if not local_ranks or k.kv_rank in local_ranks
+        ]
+        foreign_keys = [
+            k for k in obj_keys if local_ranks and k.kv_rank not in local_ranks
+        ]
 
         handle = self._ctx.storage_manager.submit_prefetch_task(
-            obj_keys,
+            local_keys,
             layout_desc,
             extra_count=extra_count,
             external_request_id=key.request_id,
             attn_desc=attn_desc,
             group_layout_descs=group_layout_descs,
         )
+        foreign_handle = None
+        if foreign_keys:
+            foreign_handle = self._ctx.storage_manager.submit_prefetch_task(
+                foreign_keys,
+                layout_desc,
+                external_request_id=key.request_id,
+                mode=PrefetchMode.EXISTS,
+                policy=TrimPolicy.SPARSE,
+            )
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
-                world_size=key.world_size,
+                world_size=len(local_keys)
+                // (len(chunk_hashes) * attn_desc.num_object_groups),
+                foreign_handle=foreign_handle,
+                foreign_ranks=len(foreign_keys)
+                // (len(chunk_hashes) * attn_desc.num_object_groups),
+                local_keys=local_keys,
+                extra_count=extra_count,
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
                 num_object_groups=attn_desc.num_object_groups,
@@ -364,11 +399,38 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
-        if found is None:
-            return None
+        with job.poll_lock:
+            with self._prefetch_job_lock:
+                if self._prefetch_jobs.get(request_id) is not job:
+                    return 0
+            found = (
+                job.local_found.count_leading_ones()
+                if job.local_found is not None
+                else self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
+            )
+            if found is None:
+                return None
 
-        return _get_prefix_hit_length(found, job.world_size, job.num_object_groups)
+            local_hits = _get_prefix_hit_length(
+                found, job.world_size, job.num_object_groups
+            )
+            if job.foreign_handle is None:
+                return local_hits
+            foreign_hits = (
+                job.foreign_found.count_leading_ones()
+                if job.foreign_found is not None
+                else self._ctx.storage_manager.query_prefetch_lookup_hits(
+                    job.foreign_handle
+                )
+            )
+            if foreign_hits is None:
+                return None
+            return min(
+                local_hits,
+                _get_prefix_hit_length(
+                    foreign_hits, job.foreign_ranks, job.num_object_groups
+                ),
+            )
 
     def query_prefetch_status(
         self,
@@ -398,36 +460,71 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if found is None:
-            return None
+        with job.poll_lock:
+            with self._prefetch_job_lock:
+                if self._prefetch_jobs.get(request_id) is not job:
+                    return 0
+            if job.local_found is None:
+                job.local_found = self._ctx.storage_manager.query_prefetch_status(
+                    job.handle
+                )
+            if job.foreign_handle is not None and job.foreign_found is None:
+                job.foreign_found = self._ctx.storage_manager.query_prefetch_status(
+                    job.foreign_handle
+                )
+            found = job.local_found
+            if found is None or (
+                job.foreign_handle is not None and job.foreign_found is None
+            ):
+                return None
 
-        # NOTE(Kuntai): this assumes two things:
-        # 1. the world size is the same between keys
-        # 2. the lookup sort the keys in prefix order and breaks at the
-        #    first failure
-        found_count = _get_prefix_hit_length(
-            found.count_leading_ones(), job.world_size, job.num_object_groups
-        )
-
-        self._ctx.event_bus.publish(
-            Event(
-                event_type=EventType.MP_LOOKUP_PREFETCH_END,
-                session_id=job.request_id,
-                metadata={
-                    "found_count": found_count,
-                    "requested_tokens": job.requested_tokens,
-                    "hit_tokens": found_count * self._ctx.chunk_size,
-                    "model_name": job.model_name,
-                    "cache_salt": job.cache_salt,
-                },
+            # NOTE(Kuntai): this assumes two things:
+            # 1. the world size is the same between keys
+            # 2. the lookup sort the keys in prefix order and breaks at the
+            #    first failure
+            found_count = _get_prefix_hit_length(
+                found.count_leading_ones(), job.world_size, job.num_object_groups
             )
-        )
 
-        with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(request_id, None)
+            if job.foreign_found is not None:
+                found_count = min(
+                    found_count,
+                    _get_prefix_hit_length(
+                        job.foreign_found.count_leading_ones(),
+                        job.foreign_ranks,
+                        job.num_object_groups,
+                    ),
+                )
+            # Release local loads beyond the prefix available on every rank.
+            retained_end = found_count * job.world_size * job.num_object_groups
+            excess_keys = [
+                job.local_keys[i]
+                for i in found.get_indices_list()
+                if i >= retained_end and i < len(job.local_keys)
+            ]
+            if excess_keys:
+                self._ctx.storage_manager.finish_read_prefetched(
+                    excess_keys, extra_count=job.extra_count
+                )
 
-        return found_count
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                    session_id=job.request_id,
+                    metadata={
+                        "found_count": found_count,
+                        "requested_tokens": job.requested_tokens,
+                        "hit_tokens": found_count * self._ctx.chunk_size,
+                        "model_name": job.model_name,
+                        "cache_salt": job.cache_salt,
+                    },
+                )
+            )
+
+            with self._prefetch_job_lock:
+                self._prefetch_jobs.pop(request_id, None)
+
+            return found_count
 
     def wait_prefetch_status(
         self,
@@ -458,8 +555,20 @@ class LookupModule:
             )
             return 0
 
-        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
-            return None
+        with job.poll_lock:
+            deadline = time.monotonic() + timeout
+            if (
+                job.local_found is None
+                and not self._ctx.storage_manager.wait_prefetch_status(
+                    job.handle, timeout
+                )
+            ):
+                return None
+            if job.foreign_handle is not None and job.foreign_found is None:
+                if not self._ctx.storage_manager.wait_prefetch_status(
+                    job.foreign_handle, max(0.0, deadline - time.monotonic())
+                ):
+                    return None
         return self.query_prefetch_status(request_id)
 
     def free_lookup_locks(
@@ -498,6 +607,10 @@ class LookupModule:
         # be over-released (e.g. window=512, LMCache hit 1024, vLLM hit 768 ->
         # chunks 512..768 may leak). Revisit when sliding-window prefetch is on.
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
+        local_ranks = self._ctx.layout_desc_registry.find_kv_ranks(
+            key.model_name, key.world_size
+        )
+        obj_keys = [k for k in obj_keys if not local_ranks or k.kv_rank in local_ranks]
 
         extra_count = compute_extra_count(tp_size, key.world_size)
 

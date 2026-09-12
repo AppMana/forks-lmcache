@@ -915,6 +915,15 @@ class PrefetchController(StorageControllerInterface):
         retained = build_trim_mask(merged_lookup, num_keys, request.policy)
         trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
 
+        if request.mode is PrefetchMode.EXISTS:
+            # Foreign pipeline ranks need presence checks, never buffers
+            # allocated from this server's different layer layout.
+            result = merge_bitmaps(trimmed_plan.values(), num_keys)
+            self._unlock_all_lookups(request)
+            self._update_lookup_results(request.request_id, result.count_leading_ones())
+            self._complete_request(request.request_id, result)
+            return
+
         if not trimmed_plan:
             # Nothing to load after trimming. Unlock all lookup locks and
             # complete with an empty retained set.

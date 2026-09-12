@@ -546,6 +546,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # The server count is derived from lmcache.mp.server_urls.
         n_servers = len(server_urls)
+        pp_server_urls = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.pp_server_urls", None
+        )
+        if pp_server_urls is not None:
+            if (
+                not isinstance(pp_server_urls, list)
+                or len(pp_server_urls)
+                != vllm_config.parallel_config.pipeline_parallel_size
+                or any(
+                    not isinstance(url, str) or not url.strip()
+                    for url in pp_server_urls
+                )
+                or n_servers != 1
+                or getattr(vllm_config.parallel_config, "data_parallel_size", 1) != 1
+            ):
+                raise ValueError(
+                    "lmcache.mp.pp_server_urls needs one nonempty URL per PP stage, "
+                    "without tensor-sharded server_urls or data parallelism"
+                )
+            server_urls = [pp_server_urls[0]]
 
         assert vllm_config.parallel_config.world_size % n_servers == 0, (
             f"world_size ({vllm_config.parallel_config.world_size}) must be "
@@ -603,6 +623,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             local_server_url = server_urls[
                 parallel_strategy.vllm_worker_id // ranks_per_node
             ]
+            if pp_server_urls is not None:
+                pp_rank = parallel_strategy.vllm_worker_id // parallel_strategy.tp_size
+                local_server_url = pp_server_urls[pp_rank]
             self.worker_adapter = LMCacheMPWorkerAdapter(
                 server_url=local_server_url,
                 context=zmq_context,

@@ -47,10 +47,14 @@ class PrefetchMode(enum.Enum):
     ``WARM`` -- speculative pre-warm with no imminent reader: loaded keys are
     retained and left unpinned (immediately resident and evictable), so a later
     lookup can hit them.
+
+    ``EXISTS`` -- check L2 presence only, releasing adapter lookup locks
+    without allocating, loading, or pinning anything in L1.
     """
 
     LOOKUP = enum.auto()
     WARM = enum.auto()
+    EXISTS = enum.auto()
 
 
 @dataclass(frozen=True)

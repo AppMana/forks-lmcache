@@ -42,6 +42,7 @@ class _LayoutDescEntry:
 
     layout_desc: MemoryLayoutDesc
     ref_count: int
+    kv_rank_counts: dict[int, int] = field(default_factory=dict)
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     """Cross-chunk attention windows of all object groups, in object-group
     order. Defaults to a single full-attention group."""
@@ -89,11 +90,13 @@ class LayoutDescRegistry:
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         group_layout_descs: Sequence[MemoryLayoutDesc] | None = None,
+        kv_rank: int | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
         Re-registering the same pair increments the active registration
-        count. The latest descriptor is retained for lookups.
+        count. Ranked registrations must have compatible layouts; legacy
+        rank-less registrations retain the latest descriptor.
 
         Args:
             model_name: The model name.
@@ -104,11 +107,12 @@ class LayoutDescRegistry:
             group_layout_descs: Memory layout of every object group, in
                 object-group order, one per attention window. Defaults to
                 ``[layout_desc]`` (a single object group).
+            kv_rank: Packed KV rank, or None for a legacy rank-less registration.
 
         Raises:
             ValueError: If ``group_layout_descs`` does not hold one layout per
                 object group of ``attn_desc``, or its first entry is not
-                ``layout_desc``.
+                ``layout_desc``, or a registered rank has a different layout.
         """
         group_layouts = _validate_group_layout_descs(
             layout_desc, attn_desc, group_layout_descs
@@ -120,21 +124,33 @@ class LayoutDescRegistry:
                 self._registry[key] = _LayoutDescEntry(
                     layout_desc=layout_desc,
                     ref_count=1,
+                    kv_rank_counts={} if kv_rank is None else {kv_rank: 1},
                     attn_desc=attn_desc,
                     group_layout_descs=group_layouts,
                 )
                 return
 
+            if entry.kv_rank_counts and (
+                entry.group_layout_descs != group_layouts
+                or entry.attn_desc != attn_desc
+            ):
+                raise ValueError(
+                    "Incompatible KV layouts: use one LMCache server per rank"
+                )
+            if kv_rank is not None:
+                entry.kv_rank_counts[kv_rank] = entry.kv_rank_counts.get(kv_rank, 0) + 1
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
             entry.group_layout_descs = group_layouts
             entry.ref_count += 1
 
-    def unregister(self, model_name: str, world_size: int) -> None:
+    def unregister(
+        self, model_name: str, world_size: int, kv_rank: int | None = None
+    ) -> None:
         """Unregister one layout descriptor registration for a pair.
 
         The descriptor is removed only when the last active registration for
-        the pair is unregistered.
+        the pair is unregistered. Supply the same kv_rank used at registration.
 
         Args:
             model_name: The model name.
@@ -146,11 +162,33 @@ class LayoutDescRegistry:
             if entry is None:
                 return
 
+            if kv_rank is not None:
+                count = entry.kv_rank_counts.get(kv_rank, 0)
+                if count == 0:
+                    raise ValueError("KV rank is not registered")
+                if count == 1:
+                    del entry.kv_rank_counts[kv_rank]
+                else:
+                    entry.kv_rank_counts[kv_rank] = count - 1
             if entry.ref_count <= 1:
                 self._registry.pop(key)
                 return
 
             entry.ref_count -= 1
+
+    def find_kv_ranks(self, model_name: str, world_size: int) -> set[int]:
+        """Return a snapshot of registered KV ranks for a model/world pair.
+
+        Args:
+            model_name: Model name used in cache keys.
+            world_size: KV world size.
+
+        Returns:
+            Registered ranks, or an empty set for legacy rank-less registrations.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            return set(entry.kv_rank_counts) if entry is not None else set()
 
     def find(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
         """Look up a layout descriptor by (model_name, world_size).
