@@ -94,11 +94,12 @@ class FakeHeartbeatThread:
 
 def _make_worker_adapter(
     extra_config: dict[str, object] | None = None,
+    parallel_strategy: ParallelStrategy | None = None,
 ) -> LMCacheMPWorkerAdapter:
     """Construct a worker adapter with the standard test arguments; the
     network boundary must already be patched (see ``fake_adapter``).
     ``extra_config`` forwards ``lmcache.mp.*`` overrides."""
-    parallel_strategy = ParallelStrategy(
+    parallel_strategy = parallel_strategy or ParallelStrategy(
         use_mla=False,
         vllm_world_size=1,
         vllm_worker_id=0,
@@ -748,3 +749,43 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     assert len(contexts) == 3
     assert adapter.transfer_ctx is contexts[2]
     contexts[1].close.assert_not_called()
+
+
+@pytest.mark.parametrize("worker_id", [0, 1, 10])
+def test_pipeline_rank_survives_registration_and_recovery(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+    worker_id: int,
+) -> None:
+    """Initial registration and reconnect retain each MLA pipeline worker rank."""
+    _, send_mock, _ = fake_adapter
+    strategy = ParallelStrategy(
+        use_mla=True,
+        vllm_world_size=11,
+        vllm_worker_id=worker_id,
+        tp_size=1,
+        pp_size=11,
+        n_servers=1,
+    )
+    adapter = _make_worker_adapter(parallel_strategy=strategy)
+    tensor = MagicMock()
+    tensor.device.type = "cuda"
+    send_mock.reset_mock()
+    adapter.register_kv_caches({"layer.0": tensor})
+    payload = send_mock.call_args.args[2]
+    assert send_mock.call_args.args[1] == RequestType.REGISTER_KV_CACHE
+    assert payload[3] == 11
+    assert payload[7] == worker_id
+    adapter.submit_store_request("rank-check", _op([[0]]), FakeCudaEvent())
+    heartbeat = FakeHeartbeatThread.instances[-1]
+    heartbeat.health_event.clear()
+    send_mock.reset_mock()
+    heartbeat.simulate_successful_ping()
+    registration = [
+        call
+        for call in send_mock.call_args_list
+        if call.args[1] == RequestType.REGISTER_KV_CACHE
+    ]
+    assert len(registration) == 1
+    assert registration[0].args[2][7] == worker_id
+    assert heartbeat.health_event.is_set()
+    adapter.shutdown()

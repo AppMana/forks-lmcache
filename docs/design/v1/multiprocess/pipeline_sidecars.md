@@ -37,3 +37,11 @@ intersection, partial asynchronous completion, release of surplus local locks,
 and an actual controller EXISTS followed by a normal load of foreign-sized
 objects. Local end-to-end verification uses a two-stage DSV4 mini checkpoint,
 two sidecars, and Redis; a restart empties both GPU and L1 caches before replay.
+
+The repeatable fork regression gate is `tests/run_appmana_fork.sh`. Run it in
+the vLLM/LMCache image with the repository mounted and native extensions
+available. Supply `REDIS_HOST` and `REDIS_PORT` for a disposable Redis database
+(the integration tests flush it). The gate covers strided MLA storage aliases,
+worker-rank preservation during registration and reconnect, per-object Redis
+sizing and malformed replies, pipeline prefix intersection, lock cleanup, and
+MQ failure responses. Require the RESP tests to pass, not skip, for a release.
