@@ -36,25 +36,58 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
-def vllm_layout_hints() -> "LayoutHints":
+# vLLM names its resolved ``KVCacheLayout`` after the physical order of the
+# ``[L, B, H, N, C]`` page grid; the hint only distinguishes heads before
+# (HND) from heads after (NHD) the block-size axis within a page.
+_VLLM_KV_LAYOUT_TO_HINT: dict[str, Literal["NHD", "HND"]] = {
+    "NHD": "NHD",
+    "HND": "HND",
+    "LBNHC": "NHD",
+    "LBHNC": "HND",
+    "BLNHC": "NHD",
+    "BLHNC": "HND",
+    "BHLNC": "HND",
+}
+
+
+def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
     """Build layout_hints dict by querying vLLM at runtime."""
     hints: dict[str, str] = {}
-    kv_layout = try_get_vllm_kv_cache_layout()
+    kv_layout = try_get_vllm_kv_cache_layout(vllm_config)
     if kv_layout is not None:
         hints["kv_layout"] = kv_layout
     return hints  # type: ignore[return-value]
 
 
-def try_get_vllm_kv_cache_layout() -> Literal["NHD", "HND"] | None:
+def try_get_vllm_kv_cache_layout(
+    vllm_config: "VllmConfig | None" = None,
+) -> Literal["NHD", "HND"] | None:
     """Try to query the KV cache layout from vLLM at runtime.
 
     Returns ``"NHD"`` or ``"HND"`` if vLLM is available and the layout
     has been configured, otherwise ``None``.
 
+    The layout vLLM resolved for the engine is read from
+    ``vllm_config.cache_config.kv_cache_layout`` when a config is given and
+    the layout has been resolved. Otherwise ``get_kv_cache_layout`` is
+    queried on vLLM trees that still export it.
+
     Please only call this where vllm is available (i.e. not in the MP server)
     We will print an error if we try to get vllm kv layout where vllm
     is not available.
     """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    layout = getattr(cache_config, "kv_cache_layout", None)
+    if layout is not None:
+        name = getattr(layout, "name", layout)
+        hint = _VLLM_KV_LAYOUT_TO_HINT.get(name)
+        if hint is None:
+            logger.warning(
+                "vLLM KV cache layout %s has no NHD/HND equivalent; "
+                "registering without a kv_layout hint",
+                name,
+            )
+        return hint
 
     # Third Party
     try:

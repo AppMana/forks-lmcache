@@ -870,3 +870,57 @@ def test_start_fails_without_pool_assignment():
         server.start()
 
     server.close()
+
+
+def test_sync_handler_error_reply():
+    """A raising SYNC handler answers with an error instead of never replying."""
+    # First Party
+    from lmcache.v1.multiprocess.mq import RemoteHandlerError
+
+    server_url = "tcp://127.0.0.1:16040"
+    context = zmq.Context.instance()
+    server = MessageQueueServer(server_url, context)
+
+    def failing_unregister(gpu_id: int) -> None:
+        raise ValueError(f"unregister boom {gpu_id}")
+
+    add_handler_helper(server, RequestType.UNREGISTER_KV_CACHE, failing_unregister)
+    add_handler_helper(server, RequestType.NOOP, test_mq_handler_helpers.noop_handler)
+    server.start()
+    try:
+        client = MessageQueueClient(server_url, context)
+        future = client.submit_request(RequestType.UNREGISTER_KV_CACHE, [7])
+        with pytest.raises(RemoteHandlerError, match="ValueError: unregister boom 7"):
+            future.result(timeout=5)
+        # The server keeps serving after a handler failure.
+        noop = client.submit_request(RequestType.NOOP, [])
+        assert noop.result(timeout=5) == "NOOP_OK"
+        client.close()
+    finally:
+        server.close()
+
+
+def test_blocking_handler_error_reply():
+    """A raising BLOCKING handler answers with an error from its pool thread."""
+    # First Party
+    from lmcache.v1.multiprocess.mq import RemoteHandlerError
+    from lmcache.v1.multiprocess.protocol import KeyType
+
+    server_url = "tcp://127.0.0.1:16041"
+    context = zmq.Context.instance()
+    server = MessageQueueServer(server_url, context)
+
+    def failing_lookup(key: KeyType, tp_size: int) -> None:
+        raise RuntimeError("lookup boom")
+
+    add_handler_helper(server, RequestType.LOOKUP, failing_lookup)
+    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
+    server.start()
+    try:
+        client = MessageQueueClient(server_url, context)
+        future = client.submit_request(RequestType.LOOKUP, [create_cache_key(1), 1])
+        with pytest.raises(RemoteHandlerError, match="RuntimeError: lookup boom"):
+            future.result(timeout=5)
+        client.close()
+    finally:
+        server.close()

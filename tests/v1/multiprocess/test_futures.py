@@ -584,3 +584,16 @@ def test_cuda_messaging_future_with_explicit_device():
     # Get result
     result = cuda_future.result()
     assert result == "explicit device", f"Expected 'explicit device', got {result}"
+
+
+def test_messaging_future_set_exception():
+    """A remote failure surfaces from result() instead of a silent hang."""
+    future = MessagingFuture[int]()
+    assert not future.query()
+
+    future.set_exception(RuntimeError("remote handler failed"))
+
+    assert future.query()
+    assert future.wait(timeout=0.1)
+    with pytest.raises(RuntimeError, match="remote handler failed"):
+        future.result(timeout=0.1)

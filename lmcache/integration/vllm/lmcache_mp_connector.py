@@ -610,6 +610,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_block_size=vllm_config.cache_config.block_size,
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                vllm_config=vllm_config,
             )
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
@@ -691,7 +692,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         engine_group_infos = create_engine_group_infos_from_vllm(
             kv_cache_config,
             kv_caches,
-            layout_hints=vllm_layout_hints(),
+            layout_hints=vllm_layout_hints(self._vllm_config),
         )
         self.worker_adapter.register_kv_caches(
             kv_caches, engine_group_infos=engine_group_infos

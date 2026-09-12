@@ -1050,6 +1050,7 @@ class LMCacheMPWorkerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
+        vllm_config: Any | None = None,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1070,6 +1071,8 @@ class LMCacheMPWorkerAdapter:
             extra_config: Optional dict with keys starting with
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+            vllm_config: The vLLM ``VllmConfig``; its resolved KV cache
+                layout becomes the registration's ``kv_layout`` hint.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
@@ -1097,6 +1100,7 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = None
         else:
             self._mp_transfer_mode = None
+        self._vllm_config = vllm_config
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1280,7 +1284,7 @@ class LMCacheMPWorkerAdapter:
         """
         self.kv_caches = kv_caches
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
-        layout_hints = vllm_layout_hints()
+        layout_hints = vllm_layout_hints(self._vllm_config)
         self.transfer_ctx = transfer_ctx
         try:
             # Register on the local, not self.transfer_ctx: a concurrent

@@ -4,11 +4,11 @@
 This is needed to mask out attention-specific details while making sure that
 LMCache can still store / load KV cache correctly.
 
-Currently there are two edits, one per :class:`KVCacheGroupEdit` subclass
-below. Both are for Mamba-hybrid models; the registry is only consulted when
-``kv_cache_config.has_mamba_layers``. :func:`validate_kv_cache_groups`
-additionally rejects, at startup, group specs the transfer path cannot serve
-correctly yet (see its docstring).
+There is one edit per :class:`KVCacheGroupEdit` subclass below. The MLA
+latent-view edit applies to every model; the two Mamba-hybrid edits are only
+consulted when ``kv_cache_config.has_mamba_layers``.
+:func:`validate_kv_cache_groups` additionally rejects, at startup, group specs
+the transfer path cannot serve correctly yet (see its docstring).
 
 Reference design: vLLM PR #42828 ("[KVConnector][DSV4] HMA support for
 Mooncake store connector") solves the same problem class for an external KV
@@ -62,6 +62,14 @@ RegisteredKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
 # one "head" holding the whole per-(K/V) slab is enough; head_size is derived
 # to fill the page.
 _SYNTHETIC_NUM_HEADS = 1
+
+# Attention kinds storing one latent vector per state (no separate V).
+_MLA_ATTENTION_KINDS = frozenset(
+    {
+        KVCacheSpecKind.MLA_ATTENTION,
+        KVCacheSpecKind.SLIDING_WINDOW_MLA,
+    }
+)
 
 # Standard-paged (non-MLA) attention kinds eligible for the sub-paged edit.
 _SUBPAGEABLE_ATTENTION_KINDS = frozenset(
@@ -349,8 +357,37 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
         return kv_cache.view(num_blocks, 2, logical_block_size, num_heads, head_size)
 
 
-# Rule registry, in match priority order.
-_EDITS: tuple[KVCacheGroupEdit, ...] = (
+class _MLALatentViewEdit(KVCacheGroupEdit):
+    """Drop the singleton head-slot axis of an MLA layer's page view.
+
+    vLLM views every per-layer KV cache as
+    ``[num_blocks, num_head_slots, num_states, content]`` (RFC #42082). An MLA
+    layer stores one latent vector per state, so its view is ``[B, 1, N, C]``
+    and vLLM's own MLA backends bind ``kv_cache.squeeze(1)``. LMCache's MLA
+    format is that same rank-3 ``[num_blocks, block_size, head_size]`` view;
+    left at rank 4 the layer would be taken for the blocks-first fused-K/V
+    layout, whose only rank-4 shape is ``[NB, NH, BS, 2 * HS]``. The squeeze
+    is a view: dim-0 keeps its (possibly padded) per-block stride.
+    """
+
+    name = "mla-latent-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        return (
+            get_kv_cache_spec_kind(spec) in _MLA_ATTENTION_KINDS
+            and isinstance(kv_cache, torch.Tensor)
+            and kv_cache.ndim == 4
+            and kv_cache.shape[1] == 1
+        )
+
+    def apply(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> torch.Tensor:
+        assert isinstance(kv_cache, torch.Tensor)
+        return kv_cache.squeeze(1)
+
+
+# Rule registries, in match priority order.
+_EDITS: tuple[KVCacheGroupEdit, ...] = (_MLALatentViewEdit(),)
+_MAMBA_HYBRID_EDITS: tuple[KVCacheGroupEdit, ...] = (
     _MambaPageViewEdit(),
     _SubpagedAttentionViewEdit(),
 )
@@ -362,10 +399,10 @@ def apply_kv_cache_group_edits(
 ) -> dict[str, RegisteredKVCache]:
     """Apply all KV cache group metadata edits for LMCache registration.
 
-    Each layer is checked against the ``_EDITS`` rules (first match wins) and
-    re-viewed by the matching rule; layers matching no rule pass through
-    unchanged. ``None`` configs and configs without Mamba groups are returned
-    as-is (as a dict): all current rules only apply to Mamba-hybrid models.
+    Each layer is checked against the ``_EDITS`` rules, plus the
+    ``_MAMBA_HYBRID_EDITS`` rules when the config has Mamba groups (first match
+    wins), and re-viewed by the matching rule; layers matching no rule pass
+    through unchanged. ``None`` configs are returned as-is (as a dict).
 
     Args:
         kv_cache_config: vLLM ``KVCacheConfig`` (read for per-group specs).
@@ -382,15 +419,18 @@ def apply_kv_cache_group_edits(
     """
     # Backstop for connectors initialized without a kv_cache_config.
     validate_kv_cache_groups(kv_cache_config)
-    if kv_cache_config is None or not kv_cache_config.has_mamba_layers:
+    if kv_cache_config is None:
         return dict(kv_caches)
+    edits = _EDITS
+    if kv_cache_config.has_mamba_layers:
+        edits += _MAMBA_HYBRID_EDITS
 
     edited = dict(kv_caches)
     counts: Counter[str] = Counter()
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         for name in group.layer_names:
-            for edit in _EDITS:
+            for edit in edits:
                 if edit.matches(spec, kv_caches[name]):
                     edited[name] = edit.apply(spec, kv_caches[name])
                     counts[edit.name] += 1

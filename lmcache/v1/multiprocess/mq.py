@@ -105,6 +105,22 @@ def msgspec_decode(b_obj: bytes, cls: Any) -> Any:
     return msgspec.msgpack.decode(b_obj, type=cls)
 
 
+# A reply to a request whose handler raised carries this marker and the
+# exception text in place of the (at most one) response frame.
+_ERROR_REPLY_MARKER = b"__lmcache_handler_error__"
+
+
+class RemoteHandlerError(RuntimeError):
+    """The server-side handler of a request raised; carries its text."""
+
+
+def _error_reply_frames(exception: BaseException) -> list[bytes]:
+    return [
+        _ERROR_REPLY_MARKER,
+        f"{type(exception).__name__}: {exception}".encode(),
+    ]
+
+
 # Shared polling loop for MessageQueueClient instances
 
 
@@ -346,7 +362,14 @@ class MessageQueueClient:
 
         if request_uid in self.pending_futures:
             future = self.pending_futures.pop(request_uid)
-            if b_response:
+            if len(b_response) == 2 and b_response[0] == _ERROR_REPLY_MARKER:
+                future.set_exception(
+                    RemoteHandlerError(
+                        f"LMCache server failed to handle {request_type.name}: "
+                        f"{b_response[1].decode(errors='replace')}"
+                    )
+                )
+            elif b_response:
                 response = msgspec_decode(b_response[0], cls=response_cls)
                 future.set_result(response)
             else:
@@ -524,13 +547,19 @@ class MessageQueueServer:
     ) -> Any:
         """
         Call the sync handler and send the response back to the client.
+        A handler that raises is answered with an error reply.
 
         Args:
             handler_entry (SyncRequestHandler[Any]): The handler entry.
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
+        try:
+            response = handler_entry(payloads)
+        except Exception as exception:
+            logger.exception("Error in sync handler")
+            self.socket.send_multipart(prefix_frames + _error_reply_frames(exception))
+            return
         response_cls = handler_entry.get_response_class()
         b_response = msgspec_encode(response, cls=response_cls)
         if response is not None:
@@ -546,7 +575,8 @@ class MessageQueueServer:
     ) -> Any:
         """
         Call the blocking handler in a separate thread and send the response
-        back to the client.
+        back to the client. A handler that raises (or whose payloads fail to
+        decode) is answered with an error reply.
 
         Args:
             handler_entry (BlockingRequestHandler[Any]): The handler entry.
@@ -555,7 +585,12 @@ class MessageQueueServer:
                 prefix_frames[0] is the zmq identity used as affinity key.
         """
         affinity_key = hash(prefix_frames[0])
-        future = handler_entry(payloads, affinity_key=affinity_key)
+        try:
+            future = handler_entry(payloads, affinity_key=affinity_key)
+        except Exception as exception:
+            logger.exception("Error submitting blocking handler")
+            self.socket.send_multipart(prefix_frames + _error_reply_frames(exception))
+            return
 
         def _notify_response(fut: Future):
             try:
@@ -567,12 +602,12 @@ class MessageQueueServer:
                     if response is not None
                     else prefix_frames
                 )
-
-                self.output_queue.put(frames_to_send)
-                self._output_efd.notify()
-
-            except Exception:
+            except Exception as exception:
                 logger.exception("Error in blocking handler")
+                frames_to_send = prefix_frames + _error_reply_frames(exception)
+
+            self.output_queue.put(frames_to_send)
+            self._output_efd.notify()
 
         future.add_done_callback(_notify_response)
 
