@@ -5,7 +5,7 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from contextlib import contextmanager
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Literal, Optional, Sequence
 import threading
 import time
 
@@ -405,6 +405,7 @@ class StorageManager:
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         skip_l2: bool = False,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        group_layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -427,6 +428,9 @@ class StorageManager:
             mode: The prefetch intent (see :class:`PrefetchMode`).  ``WARM``
                 retains loaded keys and pins none; ``LOOKUP`` (default) pins
                 them for an imminent reader and follows the policy.
+            group_layout_descs: Memory layout of every object group, in
+                object-group order; each key's L1 buffer follows its own
+                group's layout. None means every key follows ``layout_desc``.
 
         Returns:
             PrefetchHandle to track the task.
@@ -441,6 +445,7 @@ class StorageManager:
                     extra_count=extra_count,
                     policy=policy,
                     mode=mode,
+                    group_layout_descs=group_layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -495,6 +500,7 @@ class StorageManager:
                     policy=TrimPolicy.SPARSE,
                     attn_desc=attn_desc,
                     mode=mode,
+                    group_layout_descs=group_layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -561,6 +567,7 @@ class StorageManager:
                 attn_desc=attn_desc,
                 policy=policy,
                 mode=mode,
+                group_layout_descs=group_layout_descs,
             )
             # The controller indexes its result bitmap over remaining_keys
             # (0-based); map those local indices back to original positions.

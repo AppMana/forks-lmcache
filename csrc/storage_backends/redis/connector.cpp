@@ -199,14 +199,41 @@ const std::string& WorkerConn::make_key_header(const std::string& key) {
   return key_header_buf;
 }
 
-const std::string& WorkerConn::make_size_header(size_t batch_chunk_num_bytes) {
+const std::string& WorkerConn::make_size_header(size_t len) {
   size_header_buf.clear();
 
   size_header_buf += '$';
-  size_header_buf += std::to_string(batch_chunk_num_bytes);
+  size_header_buf += std::to_string(len);
   size_header_buf += crlf;
 
   return size_header_buf;
+}
+
+void WorkerConn::discard_exactly(size_t len) {
+  char sink[16384];
+  while (len > 0) {
+    size_t n = std::min(len, sizeof(sink));
+    recv_exactly(sink, n);
+    len -= n;
+  }
+}
+
+size_t WorkerConn::recv_bulk_len() {
+  std::string line = recv_line();
+  if (line[0] != '$') {
+    throw std::runtime_error("GET: unexpected reply: " + line);
+  }
+  if (line == "$-1\r\n") {
+    throw std::runtime_error("GET: key not found");
+  }
+  size_t value_len = 0;
+  for (size_t i = 1; i + crlf_len < line.size(); ++i) {
+    if (line[i] < '0' || line[i] > '9') {
+      throw std::runtime_error("GET: malformed size header: " + line);
+    }
+    value_len = value_len * 10 + static_cast<size_t>(line[i] - '0');
+  }
+  return value_len;
 }
 
 /*
@@ -247,11 +274,8 @@ WorkerConn RedisConnector::create_connection() {
 
 void RedisConnector::do_single_get(WorkerConn& conn, const std::string& key,
                                    void* buf, size_t len, size_t chunk_size) {
-  if (len != chunk_size) {
-    throw std::runtime_error("buffer size mismatch");
-  }
+  (void)chunk_size;  // each value is sized by its own buffer
 
-  const std::string& size_header = conn.make_size_header(chunk_size);
   const std::string& key_header = conn.make_key_header(key);
 
   conn.send_multipart({{conn.get_prefix.data(), conn.get_prefix.size()},
@@ -259,12 +283,15 @@ void RedisConnector::do_single_get(WorkerConn& conn, const std::string& key,
 
   // parse response in 3 steps
 
-  // 1. recv size header
-  std::vector<char> recv_size_header_buf(size_header.size());
-  conn.recv_exactly(recv_size_header_buf.data(), size_header.size());
-  if (std::memcmp(recv_size_header_buf.data(), size_header.data(),
-                  size_header.size()) != 0) {
-    throw std::runtime_error("GET: size header mismatch");
+  // 1. recv and check this value's size header
+  size_t value_len = conn.recv_bulk_len();
+  if (value_len != len) {
+    // consume the value and its trailer so the next command on this
+    // connection reads its own reply
+    conn.discard_exactly(value_len + WorkerConn::crlf_len);
+    throw std::runtime_error("GET: size header mismatch: buffer holds " +
+                             std::to_string(len) + " bytes, value has " +
+                             std::to_string(value_len));
   }
 
   // 2. recv KV Cache (payload) without parsing
@@ -283,14 +310,10 @@ void RedisConnector::do_single_get(WorkerConn& conn, const std::string& key,
 void RedisConnector::do_single_set(WorkerConn& conn, const std::string& key,
                                    const void* buf, size_t len,
                                    size_t chunk_size) {
-  // we only write exactly batch_chunk_num_bytes bytes (save_unfull_chunk must
-  // be off)
-  if (len != chunk_size) {
-    throw std::runtime_error("buffer size mismatch");
-  }
+  (void)chunk_size;  // each value is written at its own buffer's size
 
   // build headers using reusable buffers
-  const std::string& size_header = conn.make_size_header(chunk_size);
+  const std::string& size_header = conn.make_size_header(len);
   const std::string& key_header = conn.make_key_header(key);
 
   // send SET cmd

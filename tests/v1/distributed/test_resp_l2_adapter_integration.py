@@ -290,3 +290,148 @@ class TestRESPL2AdapterIntegration:
             assert adapter.get_load_event_fd() >= 0
         finally:
             adapter.close()
+
+
+def create_group_key(chunk_id: int, group: int) -> ObjectKey:
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name="test_model",
+        kv_rank=0,
+        object_group_id=group,
+    )
+
+
+def redis_strlen(key: str) -> int:
+    result = subprocess.run(
+        ["redis-cli", "-h", REDIS_HOST, "-p", str(REDIS_PORT), "STRLEN", key],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    return int(result.stdout.strip())
+
+
+def drain_native_completions(client, timeout: float = 10.0) -> list:
+    poll = select.poll()
+    poll.register(client.event_fd(), select.POLLIN)
+    assert poll.poll(timeout * 1000), "native connector did not complete"
+    return list(client.drain_completions())
+
+
+@requires_redis
+@requires_native
+class TestRESPMixedObjectSizes:
+    """DeepSeek V4's hybrid KV layout produces several object groups per
+    chunk whose objects differ in size, and one L2 batch carries all of
+    them.  Every object in a batch must be written and read at its own
+    size, and a bad reply for one key must not poison the connection for
+    the keys that follow it."""
+
+    BIG = 512  # float32 elements -> 2048 bytes
+    SMALL = 128  # float32 elements -> 512 bytes
+
+    @pytest.fixture(autouse=True)
+    def setup_adapter(self):
+        flush_redis()
+
+        # First Party
+        from lmcache.lmcache_redis import LMCacheRedisClient
+        from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
+            NativeConnectorL2Adapter,
+        )
+
+        self.adapter = NativeConnectorL2Adapter(
+            LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 4)
+        )
+        # One worker so every key of a batch is served over the same
+        # connection, which is where a desynchronized reply would show.
+        self.client = LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 1)
+        yield
+        self.adapter.close()
+        self.client.close()
+        flush_redis()
+
+    def test_store_and_load_batch_with_two_object_sizes(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
+            _object_key_to_string,
+        )
+
+        keys = [create_group_key(c, g) for g in (0, 1) for c in (0, 1)]
+        sizes = [self.BIG, self.BIG, self.SMALL, self.SMALL]
+        store_objs = [
+            create_memory_obj(size=size, fill_value=float(i + 1))
+            for i, size in enumerate(sizes)
+        ]
+        load_objs = [create_memory_obj(size=size, fill_value=0.0) for size in sizes]
+
+        store_tid = self.adapter.submit_store_task(keys, store_objs)
+        assert wait_for_event_fd(self.adapter.get_store_event_fd())
+        result = self.adapter.pop_completed_store_tasks()[store_tid]
+        assert result.is_successful()
+        assert int(result) == 4 * (2 * self.BIG + 2 * self.SMALL)
+
+        for key, size in zip(keys, sizes, strict=True):
+            assert redis_strlen(_object_key_to_string(key)) == 4 * size
+
+        load_tid = self.adapter.submit_load_task(keys, load_objs)
+        assert wait_for_event_fd(self.adapter.get_load_event_fd())
+        bitmap = self.adapter.query_load_result(load_tid)
+        for i in range(len(keys)):
+            assert bitmap.test(i) is True, f"object {i} not loaded"
+            assert torch.equal(load_objs[i].tensor, store_objs[i].tensor)
+
+    def test_native_batch_small_object_first(self):
+        small = bytes(range(256)) * 2
+        big = bytes(reversed(range(256))) * 8
+        keys = ["m@00000000@1@aa", "m@00000000@0@aa"]
+        self.client.submit_batch_set(keys, [memoryview(small), memoryview(big)])
+        (fid, ok, error, _), *rest = drain_native_completions(self.client)
+        assert ok, error
+        assert not rest
+
+        out_small = bytearray(len(small))
+        out_big = bytearray(len(big))
+        self.client.submit_batch_get(keys, [memoryview(out_small), memoryview(out_big)])
+        [(fid, ok, error, loaded)] = drain_native_completions(self.client)
+        assert ok, error
+        assert loaded == [True, True]
+        assert bytes(out_small) == small
+        assert bytes(out_big) == big
+
+    def test_get_rejects_each_size_mismatch_without_desync(self):
+        big = b"\x01" * 2048
+        small = b"\x02" * 512
+        self.client.submit_batch_set(
+            ["m@00000000@0@bb", "m@00000000@1@bb"],
+            [memoryview(big), memoryview(small)],
+        )
+        [(_, ok, error, _)] = drain_native_completions(self.client)
+        assert ok, error
+
+        # Read the 2048-byte value into a 512-byte buffer, then a correct
+        # key, then a missing key, then another correct key on the same
+        # connection.  Only the well-formed reads may succeed.
+        out_a = bytearray(512)
+        out_b = bytearray(512)
+        out_c = bytearray(512)
+        out_d = bytearray(512)
+        self.client.submit_batch_get(
+            [
+                "m@00000000@0@bb",
+                "m@00000000@1@bb",
+                "m@00000000@1@missing",
+                "m@00000000@1@bb",
+            ],
+            [
+                memoryview(out_a),
+                memoryview(out_b),
+                memoryview(out_c),
+                memoryview(out_d),
+            ],
+        )
+        [(_, ok, error, loaded)] = drain_native_completions(self.client)
+        assert ok, error
+        assert loaded == [False, True, False, True]
+        assert bytes(out_b) == small
+        assert bytes(out_d) == small

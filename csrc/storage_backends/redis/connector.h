@@ -16,7 +16,8 @@ namespace connector {
 // a TCP session (one per thread) implementing RESP2
 /*
 key optimizations include:
-1. preset batch_chunk_num_bytes (allows not parsing for \r\n byte-by-byte)
+1. only the bulk-string header of a GET reply is parsed byte-by-byte; the
+   payload is received straight into the caller's buffer at its own size
 2. scatter/gather sending of data (with pre-allocated buffers)
 3. zero copy (no bounce buffers)
 */
@@ -69,9 +70,9 @@ struct WorkerConn {
     // reserve 512 bytes to handle typical keys plus margin
     key_header_buf.reserve(512);
 
-    // pre-allocate size_header_buf for chunk size headers
-    // typical format: $<batch_chunk_num_bytes>\r\n
-    // typical batch_chunk_num_bytes: 1MB-4MB = 7-8 digit number
+    // pre-allocate size_header_buf for value size headers
+    // typical format: $<len>\r\n
+    // typical len: 1MB-4MB = 7-8 digit number
     // reserve 32 bytes to handle up to 20+ digit numbers with margin
     size_header_buf.reserve(32);
   }
@@ -85,9 +86,14 @@ struct WorkerConn {
   void send_all(const void* data, size_t len);
   void send_multipart(const std::vector<std::pair<const void*, size_t>>& parts);
   void recv_exactly(void* buf, size_t len);
+  void discard_exactly(size_t len);
   std::string recv_line();
+  // reads a bulk-string reply header and returns the value length it
+  // announces; throws for a missing key or an error reply, both of which
+  // leave the connection in sync
+  size_t recv_bulk_len();
   const std::string& make_key_header(const std::string& key);
-  const std::string& make_size_header(size_t batch_chunk_num_bytes);
+  const std::string& make_size_header(size_t len);
 };
 
 class RedisConnector : public ConnectorBase<WorkerConn> {

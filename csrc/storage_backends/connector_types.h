@@ -82,8 +82,8 @@ struct Request {
   // for batch exists tiles, track which indices this tile is responsible for
   size_t start_idx = 0;
 
-  // batch_chunk_num_bytes for get/set operations (passed per-operation, not
-  // per-connection)
+  // for get/set operations: the size every buffer of the batch shares, or 0
+  // when the buffers differ in size (buf_lens carries each one's size)
   size_t batch_chunk_num_bytes = 0;
 };
 

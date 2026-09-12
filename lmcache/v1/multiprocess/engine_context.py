@@ -2,8 +2,8 @@
 """Shared context and layout descriptor registry for engine modules."""
 
 # Standard
-from dataclasses import dataclass
-from typing import TypedDict
+from dataclasses import dataclass, field
+from typing import Sequence, TypedDict
 import threading
 
 # First Party
@@ -45,6 +45,26 @@ class _LayoutDescEntry:
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     """Cross-chunk attention windows of all object groups, in object-group
     order. Defaults to a single full-attention group."""
+    group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
+    """Memory layout of every object group, in object-group order;
+    ``group_layout_descs[0]`` is ``layout_desc``."""
+
+
+def _validate_group_layout_descs(
+    layout_desc: MemoryLayoutDesc,
+    attn_desc: AttnWindowDesc,
+    group_layout_descs: Sequence[MemoryLayoutDesc] | None,
+) -> list[MemoryLayoutDesc]:
+    if group_layout_descs is None:
+        return [layout_desc]
+    if len(group_layout_descs) != attn_desc.num_object_groups:
+        raise ValueError(
+            f"{len(group_layout_descs)} object group layouts for "
+            f"{attn_desc.num_object_groups} object groups"
+        )
+    if group_layout_descs[0] != layout_desc:
+        raise ValueError("object group 0's layout must be layout_desc")
+    return list(group_layout_descs)
 
 
 class LayoutDescRegistry:
@@ -68,6 +88,7 @@ class LayoutDescRegistry:
         world_size: int,
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
+        group_layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
@@ -77,10 +98,21 @@ class LayoutDescRegistry:
         Args:
             model_name: The model name.
             world_size: The world size.
-            layout_desc: The memory layout descriptor.
+            layout_desc: The memory layout descriptor of object group 0.
             attn_desc: Cross-chunk attention windows of all object groups, in
                 object-group order. Defaults to a single full-attention group.
+            group_layout_descs: Memory layout of every object group, in
+                object-group order, one per attention window. Defaults to
+                ``[layout_desc]`` (a single object group).
+
+        Raises:
+            ValueError: If ``group_layout_descs`` does not hold one layout per
+                object group of ``attn_desc``, or its first entry is not
+                ``layout_desc``.
         """
+        group_layouts = _validate_group_layout_descs(
+            layout_desc, attn_desc, group_layout_descs
+        )
         key = (model_name, world_size)
         with self._lock:
             entry = self._registry.get(key)
@@ -89,11 +121,13 @@ class LayoutDescRegistry:
                     layout_desc=layout_desc,
                     ref_count=1,
                     attn_desc=attn_desc,
+                    group_layout_descs=group_layouts,
                 )
                 return
 
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
+            entry.group_layout_descs = group_layouts
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -157,6 +191,30 @@ class LayoutDescRegistry:
                     f"{model_name!r} with world size {world_size}"
                 )
             return entry.attn_desc
+
+    def find_group_layout_descs(
+        self, model_name: str, world_size: int
+    ) -> list[MemoryLayoutDesc]:
+        """Look up the memory layout of every object group for a pair.
+
+        Args:
+            model_name: The model name.
+            world_size: The world size.
+
+        Returns:
+            The layouts registered for the pair, in object-group order.
+
+        Raises:
+            ValueError: If no descriptor is registered for the pair.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            if entry is None:
+                raise ValueError(
+                    f"No layout registered for model {model_name!r} with "
+                    f"world size {world_size}"
+                )
+            return list(entry.group_layout_descs)
 
 
 class MPCacheServerContext:

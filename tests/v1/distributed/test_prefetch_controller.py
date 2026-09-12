@@ -20,6 +20,7 @@ import torch
 # First Party
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
     PrefetchMode,
@@ -1498,3 +1499,69 @@ class TestPrefetchMode:
 
         ctrl.stop()
         adapter.close()
+
+
+# =============================================================================
+# Object Group Layouts
+# =============================================================================
+
+
+class TestObjectGroupLayouts:
+    """A hybrid KV layout stores several object groups per chunk whose objects
+    differ in size; each key's L1 load buffer must follow its own group."""
+
+    def test_load_reserves_each_object_group_at_its_own_layout(self, l1_manager):
+        adapter = make_adapter()
+        layouts = [
+            MemoryLayoutDesc(
+                shapes=[torch.Size([100, 2, 512])], dtypes=[torch.bfloat16]
+            ),
+            MemoryLayoutDesc(
+                shapes=[torch.Size([25, 2, 512])], dtypes=[torch.bfloat16]
+            ),
+        ]
+        # Chunk-major, as the lookup module lays keys out: c0g0, c0g1, c1g0, c1g1.
+        keys = [
+            ObjectKey(
+                chunk_hash=ObjectKey.IntHash2Bytes(chunk),
+                model_name="test_model",
+                kv_rank=0,
+                object_group_id=group,
+            )
+            for chunk in range(2)
+            for group in range(2)
+        ]
+        for group, layout in enumerate(layouts):
+            store_keys_in_l2(
+                adapter, [k for k in keys if k.object_group_id == group], layout
+            )
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        try:
+            req_id = ctrl.submit_prefetch_request(
+                keys,
+                layouts[0],
+                attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, -1]),
+                group_layout_descs=layouts,
+            )
+            assert wait_for_prefetch_result(ctrl, req_id) == len(keys)
+
+            for key in keys:
+                state = l1_manager.get_object_state(key)
+                assert state is not None, f"{key} not in L1"
+                layout = layouts[key.object_group_id]
+                assert state.memory_obj.get_size() == (
+                    layout.shapes[0].numel() * layout.dtypes[0].itemsize
+                )
+                assert torch.equal(
+                    state.memory_obj.tensor, adapter._memory_objects[key].tensor
+                )
+        finally:
+            ctrl.stop()
+            adapter.close()

@@ -303,3 +303,25 @@ def test_lookup_single_group_matches_single_group_layout():
 
     expected = ipc_key_to_object_keys(_lookup_key(world_size=2), chunk_hashes, [0])[0]
     assert keys == expected
+
+
+def test_lookup_submits_every_object_groups_layout():
+    """lookup() hands the prefetch the registry's per-group layouts so each
+    key's L1 buffer is sized by its own object group."""
+    ctx = MagicMock()
+    ctx.chunk_size = 16
+    ctx.event_bus.has_subscribers.return_value = False
+    ctx.layout_desc_registry.find.return_value = MagicMock()  # non-None layout
+    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+        num_chunks_in_sw=[-1, 2]
+    )
+    group_layouts = [MagicMock(), MagicMock()]
+    ctx.layout_desc_registry.find_group_layout_descs.return_value = group_layouts
+    ctx.token_hasher.compute_chunk_hashes.return_value = [b"c0", b"c1"]
+
+    module = LookupModule(ctx)
+    module.lookup(_lookup_key(world_size=1), tp_size=1)
+
+    ctx.storage_manager.submit_prefetch_task.assert_called_once()
+    kwargs = ctx.storage_manager.submit_prefetch_task.call_args.kwargs
+    assert kwargs["group_layout_descs"] is group_layouts

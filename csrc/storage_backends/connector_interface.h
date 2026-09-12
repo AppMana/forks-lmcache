@@ -28,10 +28,10 @@ class IStorageConnector {
 
   args:
     keys: vector of key strings to retrieve
-    bufs: vector of buffer pointers (must be writable, size ==
-  batch_chunk_num_bytes for each buffer) lens: vector of buffer sizes (each must
-  equal batch_chunk_num_bytes) batch_chunk_num_bytes: expected size of each
-  value (optimization: avoids parsing)
+    bufs: vector of writable buffer pointers, one per key
+    lens: size of each buffer, which must equal the size of the stored value
+    batch_chunk_num_bytes: the size every buffer in the batch shares, or 0
+  when the buffers differ in size; connectors size each value from lens[i]
 
   returns:
     uint64_t: future id for tracking this batch operation
@@ -50,10 +50,10 @@ class IStorageConnector {
 
   args:
     keys: vector of key strings to store
-      bufs: vector of buffer pointers (must be readable, size ==
-  batch_chunk_num_bytes for each buffer) lens: vector of buffer sizes (each must
-  equal batch_chunk_num_bytes) batch_chunk_num_bytes: size of each value
-  (optimization: avoids parsing)
+    bufs: vector of readable buffer pointers, one per key
+    lens: size of each buffer, which is the size of the value written
+    batch_chunk_num_bytes: the size every buffer in the batch shares, or 0
+  when the buffers differ in size; connectors size each value from lens[i]
 
   returns:
     uint64_t: future id for tracking this batch operation

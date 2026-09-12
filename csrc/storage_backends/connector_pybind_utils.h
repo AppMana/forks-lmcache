@@ -46,6 +46,18 @@ example usage (see `redis/pybind.cpp`):
                ConnectorType>())                                       \
       .def("close", &ConnectorType::close)
 
+// the size every buffer in a batch shares, or 0 when the buffers differ in
+// size (a batch carries every object group of a chunk, and object groups of
+// a hybrid KV layout have different sizes)
+inline size_t uniform_buffer_len(const std::vector<size_t>& lens) {
+  for (size_t len : lens) {
+    if (len != lens[0]) {
+      return 0;
+    }
+  }
+  return lens[0];
+}
+
 template <typename ConnectorType>
 auto bind_submit_batch_get() {
   return [](ConnectorType& self, const std::vector<std::string>& keys,
@@ -70,8 +82,7 @@ auto bind_submit_batch_get() {
       lens.push_back(static_cast<size_t>(info.size));
     }
 
-    // use the first buffer's size as batch_chunk_num_bytes (all must match)
-    size_t batch_chunk_num_bytes = lens[0];
+    size_t batch_chunk_num_bytes = uniform_buffer_len(lens);
 
     py::gil_scoped_release release;
     return self.submit_batch_get(keys, bufs, lens, batch_chunk_num_bytes);
@@ -102,8 +113,7 @@ auto bind_submit_batch_set() {
       lens.push_back(static_cast<size_t>(info.size));
     }
 
-    // use the first buffer's size as batch_chunk_num_bytes (all must match)
-    size_t batch_chunk_num_bytes = lens[0];
+    size_t batch_chunk_num_bytes = uniform_buffer_len(lens);
 
     py::gil_scoped_release release;
     return self.submit_batch_set(keys, bufs, lens, batch_chunk_num_bytes);

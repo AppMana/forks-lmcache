@@ -110,13 +110,14 @@ class MyConnector : public lmcache::connector::ConnectorBase<MyConn> {
     return conn;
   }
 
-  // 2. GET: read value for key into buf (buf has chunk_size bytes)
+  // 2. GET: read value for key into buf (buf has len bytes; chunk_size is
+  //    the size every buffer of the batch shares, or 0 when they differ)
   void do_single_get(MyConn& conn, const std::string& key,
                      void* buf, size_t len, size_t chunk_size) override {
     // send GET, recv response into buf
   }
 
-  // 3. SET: write chunk_size bytes from buf under key
+  // 3. SET: write len bytes from buf under key
   void do_single_set(MyConn& conn, const std::string& key,
                      const void* buf, size_t len, size_t chunk_size) override {
     // send SET with data from buf

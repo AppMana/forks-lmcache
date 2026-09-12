@@ -15,7 +15,7 @@ The controller runs a background thread with an event-driven loop that:
 # Standard
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Sequence
 import enum
 import select
 import threading
@@ -123,6 +123,19 @@ PREFETCH_LOOP_POLL_TIMEOUT_MS = 500
 
 PrefetchRequestId = int
 
+# A submitted request waiting to start: the arguments of
+# submit_prefetch_request in order.
+_PendingRequest = tuple[
+    PrefetchRequestId,
+    list[ObjectKey],
+    MemoryLayoutDesc,
+    int,
+    TrimPolicy,
+    AttnWindowDesc,
+    PrefetchMode,
+    Sequence[MemoryLayoutDesc] | None,
+]
+
 
 class PrefetchPhase(enum.Enum):
     LOOKUP = enum.auto()
@@ -148,6 +161,10 @@ class InFlightPrefetchRequest:
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     """Cross-chunk attention windows of all object groups, in object-group
     order."""
+    group_layout_descs: Sequence[MemoryLayoutDesc] | None = None
+    """Memory layout of every object group, in object-group order; each key's
+    L1 buffer follows ``group_layout_descs[key.object_group_id]``.  None means
+    every key follows ``layout_desc``."""
     mode: PrefetchMode = PrefetchMode.LOOKUP
     """The prefetch intent (see :class:`PrefetchMode`).  ``WARM`` forces all
     loaded keys permanent and acquires no read lock; ``LOOKUP`` defers
@@ -173,6 +190,24 @@ class InFlightPrefetchRequest:
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
+
+    def keys_by_layout(
+        self, keys: list[ObjectKey]
+    ) -> list[tuple[MemoryLayoutDesc, list[int]]]:
+        """Group the indices of ``keys`` by the layout their L1 buffer takes.
+
+        With ``group_layout_descs`` every key follows its object group's
+        layout; without them every key follows ``layout_desc``.
+        """
+        if self.group_layout_descs is None:
+            return [(self.layout_desc, list(range(len(keys))))]
+        by_group: dict[int, list[int]] = defaultdict(list)
+        for i, key in enumerate(keys):
+            by_group[key.object_group_id].append(i)
+        return [
+            (self.group_layout_descs[group], indices)
+            for group, indices in by_group.items()
+        ]
 
     def all_loads_done(self) -> bool:
         return len(self.pending_load_tasks) == 0
@@ -236,17 +271,7 @@ class PrefetchController(StorageControllerInterface):
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
-        self._pending_queue: list[
-            tuple[
-                PrefetchRequestId,
-                list[ObjectKey],
-                MemoryLayoutDesc,
-                int,
-                TrimPolicy,
-                AttnWindowDesc,
-                PrefetchMode,
-            ]
-        ] = []
+        self._pending_queue: list[_PendingRequest] = []
 
         # Shadow counters for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -256,17 +281,7 @@ class PrefetchController(StorageControllerInterface):
 
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
-        self._submission_queue: list[
-            tuple[
-                PrefetchRequestId,
-                list[ObjectKey],
-                MemoryLayoutDesc,
-                int,
-                TrimPolicy,
-                AttnWindowDesc,
-                PrefetchMode,
-            ]
-        ] = []
+        self._submission_queue: list[_PendingRequest] = []
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
 
@@ -350,6 +365,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        group_layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> PrefetchRequestId:
         """
         Submit a prefetch request for the given keys.
@@ -382,6 +398,10 @@ class PrefetchController(StorageControllerInterface):
                 forces every loaded key permanent and acquires no read lock;
                 ``LOOKUP`` defers retention to the configured
                 :class:`PrefetchPolicy` and read-locks loaded keys.
+            group_layout_descs: Memory layout of every object group, in
+                object-group order; each key's L1 write buffer follows its
+                own group's layout. None means every key follows
+                ``layout_desc``.
 
         Returns:
             A request ID for tracking via query_prefetch_result.
@@ -390,7 +410,16 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append(
-                (request_id, keys, layout_desc, extra_count, policy, attn_desc, mode)
+                (
+                    request_id,
+                    keys,
+                    layout_desc,
+                    extra_count,
+                    policy,
+                    attn_desc,
+                    mode,
+                    group_layout_descs,
+                )
             )
         self._submission_efd.notify()
         return request_id
@@ -774,12 +803,26 @@ class PrefetchController(StorageControllerInterface):
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, keys, layout_desc, extra_count, policy, attn_desc, mode = (
-                self._pending_queue.pop(0)
-            )
+            (
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                group_layout_descs,
+            ) = self._pending_queue.pop(0)
             self._status_pending_count -= 1
             self._start_lookup_phase(
-                request_id, keys, layout_desc, extra_count, policy, attn_desc, mode
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                group_layout_descs,
             )
 
     # =========================================================================
@@ -795,6 +838,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        group_layout_descs: Sequence[MemoryLayoutDesc] | None = None,
     ) -> None:
         """Submit lookup_and_lock to all live (non-draining) adapters for a
         new request."""
@@ -822,6 +866,7 @@ class PrefetchController(StorageControllerInterface):
             extra_count=extra_count,
             policy=policy,
             attn_desc=attn_desc,
+            group_layout_descs=group_layout_descs,
             mode=mode,
             pending_lookup_tasks=pending_lookup_tasks,
         )
@@ -899,12 +944,16 @@ class PrefetchController(StorageControllerInterface):
             retentions = self._policy.select_l1_retentions(
                 keys_to_reserve,
             )
-        write_results = l1_mgr.reserve_write(
-            keys=keys_to_reserve,
-            is_temporary=[not r for r in retentions],
-            layout_desc=request.layout_desc,
-            mode="new",
-        )
+        write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
+        for layout_desc, indices in request.keys_by_layout(keys_to_reserve):
+            write_results.update(
+                l1_mgr.reserve_write(
+                    keys=[keys_to_reserve[i] for i in indices],
+                    is_temporary=[not retentions[i] for i in indices],
+                    layout_desc=layout_desc,
+                    mode="new",
+                )
+            )
 
         # Step 4: filter to successfully reserved keys
         reserved_key_set: set[ObjectKey] = set()
@@ -980,12 +1029,8 @@ class PrefetchController(StorageControllerInterface):
             )
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
-            # events.  Uniform layout per chunk -> size * count.
-            total_bytes = (
-                per_adapter_objs[0].get_size() * len(per_adapter_objs)
-                if per_adapter_objs
-                else 0
-            )
+            # events.
+            total_bytes = sum(obj.get_size() for obj in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 
             self._event_bus.publish(
