@@ -17,5 +17,6 @@ python3 -m pytest -q -rs \
  tests/v1/multiprocess/test_query_lookup_hits.py \
  tests/v1/multiprocess/test_free_locks.py \
  tests/v1/multiprocess/test_mq.py \
+ tests/v1/multiprocess/test_worker_liveness.py \
  tests/v1/distributed/test_prefetch_controller.py \
  tests/v1/distributed/test_resp_l2_adapter_integration.py "$@"

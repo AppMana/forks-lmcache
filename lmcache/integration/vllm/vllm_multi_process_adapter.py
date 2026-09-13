@@ -1234,7 +1234,7 @@ class LMCacheMPWorkerAdapter:
         engine_group_infos: Sequence[EngineGroupInfo] = (),
     ) -> None:
         """
-        Register the kv caches with LMCache server.
+        Register KV caches and start keepalive before the first request.
 
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
@@ -1262,6 +1262,7 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
         self._send_register_kv_caches_request(kv_caches)
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1311,12 +1312,14 @@ class LMCacheMPWorkerAdapter:
             ) from None
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start keepalive at registration, or on first transfer if unregistered.
 
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
         ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
+        is needed at startup, and the first store/retrieve is not gated. Starting
+        at registration also protects workers during idle periods and model
+        warmup before their first request. The
         recover callback still re-registers on a genuine unhealthy->healthy
         edge (server restart).
         """

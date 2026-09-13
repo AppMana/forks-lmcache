@@ -45,3 +45,8 @@ available. Supply `REDIS_HOST` and `REDIS_PORT` for a disposable Redis database
 worker-rank preservation during registration and reconnect, per-object Redis
 sizing and malformed replies, pipeline prefix intersection, lock cleanup, and
 MQ failure responses. Require the RESP tests to pass, not skip, for a release.
+
+Worker registration starts the heartbeat immediately. Waiting until the first
+store or retrieve leaves an idle engine without liveness signals, allowing the
+server to reap its GPU context before the first request. Reconnect still
+re-registers caches before the worker becomes healthy.

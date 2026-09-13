@@ -789,3 +789,22 @@ def test_pipeline_rank_survives_registration_and_recovery(
     assert registration[0].args[2][7] == worker_id
     assert heartbeat.health_event.is_set()
     adapter.shutdown()
+
+
+def test_registration_keeps_idle_worker_alive_before_first_request(
+    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
+) -> None:
+    """An idle registered worker must ping before any store/retrieve is submitted."""
+    adapter, send_mock, _ = fake_adapter
+    tensor = MagicMock()
+    tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": tensor})
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.calls == ["register_recover_callback", "start"]
+    assert heartbeat.instance_id == adapter.instance_id
+    assert adapter.is_healthy
+    assert [c.args[1] for c in send_mock.call_args_list] == [
+        RequestType.REGISTER_KV_CACHE
+    ]
+    adapter.shutdown()
