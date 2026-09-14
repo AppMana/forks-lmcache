@@ -450,3 +450,26 @@ def calculate_draft_layers(vllm_config: "VllmConfig") -> int:
 
 def is_dp_rank0(vllm_config: "VllmConfig") -> bool:
     return vllm_config.parallel_config.data_parallel_rank_local == 0
+
+
+def multimodal_cache_salt(request: "Request") -> str:
+    """Bind MP cache keys to full image identities without changing router tokens.
+
+    Text requests retain their original salt. Image requests conservatively
+    isolate the whole prompt by its ordered modality identities and positions.
+    This also preserves the caller's isolation salt and survives preemption.
+    """
+    import json
+
+    salt = request.cache_salt or ""
+    hashes, positions = extract_mm_features(request, modify=False)
+    if not hashes:
+        return salt
+    if len(hashes) != len(positions):
+        raise ValueError("Multimodal cache identities and positions must match")
+    identity = [
+        (identifier, position.offset, position.length)
+        for identifier, position in zip(hashes, positions, strict=True)
+    ]
+    payload = json.dumps([salt, identity], ensure_ascii=True, separators=(",", ":"))
+    return "lmcache-mm-v1:" + hashlib.sha256(payload.encode()).hexdigest()

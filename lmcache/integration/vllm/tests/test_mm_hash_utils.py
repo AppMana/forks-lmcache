@@ -110,3 +110,61 @@ def test_apply_mm_hashes_to_token_ids_multiple_placeholders_and_length_mismatch(
     # Other regions remain unchanged.
     assert out[3:5].tolist() == [0, 0]
     assert out[9:12].tolist() == [0, 0, 0]
+
+
+def test_multimodal_cache_salt_isolates_images_positions_and_users() -> None:
+    from types import SimpleNamespace
+    from lmcache.integration.vllm.utils import multimodal_cache_salt
+
+    def request(identifiers=("image-a",), offset=5, salt="user-a"):
+        return SimpleNamespace(
+            cache_salt=salt,
+            mm_features=[
+                SimpleNamespace(
+                    identifier=x, mm_position=DummyPlaceholderRange(offset + i, 10)
+                )
+                for i, x in enumerate(identifiers)
+            ],
+        )
+
+    original = request()
+    key = multimodal_cache_salt(original)
+    assert key == multimodal_cache_salt(request())
+    assert key != multimodal_cache_salt(request(("image-b",)))
+    assert key != multimodal_cache_salt(request(offset=6))
+    assert key != multimodal_cache_salt(request(salt="user-b"))
+    assert multimodal_cache_salt(request(("a", "b"))) != multimodal_cache_salt(
+        request(("b", "a"))
+    )
+    assert multimodal_cache_salt(request(identifiers=())) == "user-a"
+    assert original.cache_salt == "user-a"
+    assert original.mm_features[0].identifier == "image-a"
+
+
+def test_mp_tracker_preserves_router_ids_and_separates_image_cache_keys() -> None:
+    from types import SimpleNamespace
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPRequestTracker
+
+    tokens = [7, 128431, 128432, 128433, 9]
+
+    def tracker(image):
+        request = SimpleNamespace(
+            request_id="test-image",
+            cache_salt="tenant",
+            all_token_ids=tokens,
+            mm_features=[
+                SimpleNamespace(
+                    identifier=image, mm_position=DummyPlaceholderRange(1, 3)
+                )
+            ],
+        )
+        return LMCacheMPRequestTracker(request)
+
+    first, repeated, different = (
+        tracker("image-a"),
+        tracker("image-a"),
+        tracker("image-b"),
+    )
+    assert first.cache_salt == repeated.cache_salt
+    assert first.cache_salt != different.cache_salt
+    assert first.all_token_ids == tokens == [7, 128431, 128432, 128433, 9]

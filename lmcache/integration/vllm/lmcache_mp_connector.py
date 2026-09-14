@@ -210,7 +210,9 @@ class LMCacheMPRequestTracker:
 
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
-        self.cache_salt: str = request.cache_salt or ""
+        from lmcache.integration.vllm.utils import multimodal_cache_salt
+
+        self.cache_salt = multimodal_cache_salt(request)
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
