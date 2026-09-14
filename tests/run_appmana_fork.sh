@@ -10,6 +10,7 @@ command -v redis-cli >/dev/null
 redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping | grep -qx PONG
 python3 -c 'import torch; from lmcache.lmcache_redis import LMCacheRedisClient'
 python3 -m pytest -q -rs \
+ lmcache/integration/vllm/tests/test_mm_hash_utils.py \
  tests/v1/gpu_connector/test_contiguity_strided_cudaipc.py \
  tests/v1/test_vllm_layout_hints.py \
  tests/v1/test_vllm_mp_adapter.py \
