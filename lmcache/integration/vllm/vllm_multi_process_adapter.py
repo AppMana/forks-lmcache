@@ -1394,6 +1394,9 @@ class LMCacheMPWorkerAdapter:
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
+        # Request IDs whose retrieve failed, for KV layouts with several
+        # cache groups where vLLM cannot map block IDs back to requests.
+        self.error_request_ids: set[str] = set()
 
         # Retrieve request ids dropped by the unhealthy early-return of
         # submit_retrieve_request. get_finished must still report each id
@@ -1833,6 +1836,7 @@ class LMCacheMPWorkerAdapter:
 
         if not self.is_healthy:
             self.error_block_ids.update(op.flat_block_ids)
+            self.error_request_ids.add(request_id)
             self._dropped_retrieves.add(request_id)
             return
 
@@ -2019,6 +2023,7 @@ class LMCacheMPWorkerAdapter:
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
+                self.error_request_ids.add(request_id)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -2073,6 +2078,7 @@ class LMCacheMPWorkerAdapter:
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
+                self.error_request_ids.add(request_id)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -2151,6 +2157,7 @@ class LMCacheMPWorkerAdapter:
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
+                self.error_request_ids.add(request_id)
             self.store_futures.clear()
             self.retrieve_futures.clear()
             self.store_events.clear()
@@ -2202,6 +2209,7 @@ class LMCacheMPWorkerAdapter:
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
+                self.error_request_ids.add(request_id)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -2298,6 +2306,17 @@ class LMCacheMPWorkerAdapter:
         """
         errors = self.error_block_ids.copy()
         self.error_block_ids.clear()
+        return errors
+
+    def get_request_ids_with_load_errors(self) -> set[str]:
+        """
+        Returns the request IDs whose retrieve failed (timeout, unhealthy
+        server, or a retrieve future that reported failure), then clears the
+        internal set. Reported no later than the pass in which the request
+        is returned as finished receiving.
+        """
+        errors = self.error_request_ids.copy()
+        self.error_request_ids.clear()
         return errors
 
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:

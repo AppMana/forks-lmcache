@@ -636,7 +636,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     "lmcache.mp.pp_server_urls needs one nonempty URL per PP stage, "
                     "without tensor-sharded server_urls or data parallelism"
                 )
-            pp_server_urls = [_ensure_transport_scheme(u.strip()) for u in pp_server_urls]
+            pp_server_urls = [
+                _ensure_transport_scheme(u.strip()) for u in pp_server_urls
+            ]
             server_urls = [pp_server_urls[0]]
         if (
             is_mp_server_autostart_enabled(
@@ -1082,8 +1084,34 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
               appear here no later than that same pass.
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
+            - On a layout with several KV cache groups block IDs are only
+              unique within a group and vLLM refuses them; the failed
+              requests are then reported through ``get_transfer_results``
+              instead and this returns an empty set.
         """
-        return self.worker_adapter.get_block_ids_with_load_errors()
+        errors = self.worker_adapter.get_block_ids_with_load_errors()
+        if self._reports_load_failures_per_request():
+            return set()
+        return errors
+
+    def _reports_load_failures_per_request(self) -> bool:
+        kv_cache_config = getattr(self, "_kv_cache_config", None)
+        groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
+        return len(groups) > 1
+
+    def get_transfer_results(self, finished_req_ids: set[str]):
+        """Completed sends and receives plus the receives that failed.
+
+        A failed receive is reported per request so that the scheduler can
+        recompute it on any KV layout; it is also listed as finished
+        receiving, which releases the request from its transfer wait.
+        """
+        results = super().get_transfer_results(finished_req_ids)
+        failed = self.worker_adapter.get_request_ids_with_load_errors()
+        if failed:
+            results.failed_recving |= failed
+            results.finished_recving |= failed
+        return results
 
     def get_kv_connector_kv_cache_events(self) -> LMCacheMPKVEvents | None:
         """Return worker-side KV cache events collected since the last step.

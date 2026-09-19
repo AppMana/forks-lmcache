@@ -1695,3 +1695,30 @@ def test_registration_keeps_idle_worker_alive_before_first_request(
     req_client.store.assert_not_called()
     req_client.retrieve.assert_not_called()
     adapter.shutdown()
+
+
+def test_failed_retrieve_reports_request_id_and_block_ids(fake_adapter, monkeypatch):
+    """A failed retrieve is reported both as block ids (single-group layouts)
+    and as the request id (multi-group layouts, where vLLM refuses block
+    ids); both drain on read."""
+    adapter, _send_mock, _ = fake_adapter
+    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.kv_caches = {"layer.0": fake_tensor}
+    transfer_ctx = MagicMock()
+    retrieve_future = MagicMock()
+    retrieve_future.query.return_value = True
+    retrieve_future.result.return_value = False
+    transfer_ctx.submit_retrieve.return_value = retrieve_future
+    adapter.transfer_ctx = transfer_ctx
+    op = LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=[[7]], start=0, end=4)
+
+    adapter.submit_retrieve_request("req-1", op, event=MagicMock())
+    _finished_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_request_ids_with_load_errors() == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {7}
+    assert adapter.get_request_ids_with_load_errors() == set()
+    assert adapter.get_block_ids_with_load_errors() == set()
