@@ -54,9 +54,13 @@ class _FakeStorageManager:
     _polls: int = 0
     _total: int = 0
 
-    def submit_prefetch_task(self, keys, layout_desc, mode=None, policy=None, **_):
-        self._total = len(keys)
-        self.submit_args = {"keys": list(keys), "mode": mode, "policy": policy}
+    def submit_prefetch_task(self, spec):
+        self._total = len(spec.keys)
+        self.submit_args = {
+            "keys": list(spec.keys),
+            "mode": spec.mode,
+            "policy": spec.policy,
+        }
         return _FakeHandle(self._total)
 
     def query_prefetch_status(self, handle):
@@ -65,7 +69,7 @@ class _FakeStorageManager:
             return None
         return _FakeBitmap(self.found)
 
-    def finish_read_prefetched(self, keys, extra_count: int = 0) -> None:
+    def finish_read_prefetched(self, keys, read_locks: int = 1) -> None:
         # Must never be called: the warm holds no lock.
         self.finish_called = True
 

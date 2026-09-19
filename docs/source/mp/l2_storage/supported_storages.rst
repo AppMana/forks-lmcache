@@ -16,6 +16,9 @@ target.
    * - :doc:`NIXL <nixl>`
      - ``nixl_store`` / ``nixl_store_dynamic``
      - High-performance I/O
+   * - :doc:`Native NIXL <nixl_native>`
+     - ``nixl_native``
+     - High-performance FILE / OBJECT I/O
    * - :doc:`FileSystem <fs>`
      - ``fs``
      - File & Block
@@ -25,6 +28,12 @@ target.
    * - :doc:`Raw Block (Rust) <raw_block>`
      - ``raw_block``
      - File & Block
+   * - :doc:`Bigtable <bigtable>`
+     - ``bigtable``
+     - Remote & Distributed
+   * - :doc:`SageMaker HyperPod <sagemaker_hyperpod>`
+     - ``sagemaker-hyperpod``
+     - Remote & Distributed
    * - :doc:`S3 <s3>`
      - ``s3``
      - Remote & Distributed
@@ -36,6 +45,9 @@ target.
      - Remote & Distributed
    * - :doc:`RESP (Redis/Valkey) <resp>`
      - ``resp``
+     - Remote & Distributed
+   * - :doc:`Valkey <valkey>`
+     - ``valkey``
      - Remote & Distributed
    * - :doc:`Aerospike <aerospike>`
      - ``aerospike``
@@ -49,13 +61,18 @@ target.
    * - :doc:`Fault Inject <fault_inject>`
      - ``fault_inject``
      - Testing
+   * - :doc:`Plugin <plugin>`
+     - ``plugin`` / ``native_plugin``
+     - Custom / External
 
 .. toctree::
    :maxdepth: 1
 
    nixl
+   nixl_native
    file_and_block
    remote_and_distributed
    dax
    mock
    fault_inject
+   plugin

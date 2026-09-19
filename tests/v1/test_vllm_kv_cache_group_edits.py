@@ -87,7 +87,7 @@ def test_mla_views_drop_singleton_head_slot_axis():
         "swa.0": _padded_page_view(STATES, ROW),
     }
 
-    edited = apply_kv_cache_group_edits(config, caches)
+    edited = apply_kv_cache_group_edits(config, caches, {})
 
     for name, original in caches.items():
         view = edited[name]
@@ -113,6 +113,6 @@ def test_non_mla_fused_views_are_left_alone():
     # [B, 1, N, C]; only the spec tells it apart from an MLA latent.
     fused = torch.zeros(NB, 1, 16, 2 * 64, dtype=torch.float16)
 
-    edited = apply_kv_cache_group_edits(config, {"attn.0": fused})
+    edited = apply_kv_cache_group_edits(config, {"attn.0": fused}, {})
 
     assert edited["attn.0"] is fused

@@ -28,6 +28,7 @@ class _FakeKVLayerGroupsManager:
 class _FakeGPUContext:
     """Small stand-in for GPUCacheContext used by registration tests."""
 
+    device: torch.device = torch.device("cpu")
     num_layers: int = 2
     kv_layer_groups_manager: _FakeKVLayerGroupsManager = _FakeKVLayerGroupsManager()
 
@@ -49,17 +50,23 @@ class _FakeDeviceHostFuncDispatcher:
 
 
 @pytest.fixture
-def stub_native_storage_ops() -> Any:
+def stub_lmcache_native() -> Any:
     """Stub native modules so MP server imports work in source-only test runs."""
-    module = types.ModuleType("lmcache.native_storage_ops")
+    module = types.ModuleType("lmcache.lmcache_native")
     module_any = cast(Any, module)
+    module_any.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
+    module_any.KernelGroupSpec = type(
+        "KernelGroupSpec",
+        (),
+        {"__init__": lambda self, *args, **kwargs: None},
+    )
     module_any.TTLLock = type("TTLLock", (), {})
     module_any.Bitmap = type("Bitmap", (), {})
     module_any.PeriodicEventNotifier = type("PeriodicEventNotifier", (), {})
     with patch.dict(
         sys.modules,
         {
-            "lmcache.native_storage_ops": module,
+            "lmcache.lmcache_native": module,
             "cupy": MagicMock(),
         },
     ):
@@ -68,7 +75,7 @@ def stub_native_storage_ops() -> Any:
 
 def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     monkeypatch: pytest.MonkeyPatch,
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
 ) -> None:
     """Unregistering one shared GPU instance must not remove the shared layout."""
     # First Party
@@ -94,6 +101,7 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
         engine_group_infos: object = (),
         engine_type: object = None,
         separate_object_groups: bool = False,
+        full_sw_kv: bool = False,
     ) -> _FakeGPUContext:
         """Return a fake cache context without touching CUDA or wrappers."""
         return _FakeGPUContext()
@@ -160,7 +168,28 @@ def test_registry_attn_desc_roundtrip() -> None:
         "m", 2, _layout(), attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2])
     )
 
-    assert registry.find_attn_desc("m", 2).num_chunks_in_sw == [-1, 2]
+    desc = registry.find_attn_desc("m", 2)
+    assert desc.num_chunks_in_sw == [-1, 2]
+    assert desc.world_size == 2
+
+
+def test_registry_derives_group_layout_descs_when_not_given() -> None:
+    """A registration without group_layout_descs (engine-driven, blend,
+    qstore) still yields one shared-layout entry per object group, so
+    lookups never hit the missing-group-layouts error path."""
+    # First Party
+    from lmcache.v1.distributed.api import AttnWindowDesc
+    from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
+
+    registry = LayoutDescRegistry()
+    layout = _layout()
+    registry.register("m", 1, layout)
+    assert registry.find_group_layout_descs("m", 1) == {0: layout}
+
+    registry.register(
+        "m2", 1, layout, attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2])
+    )
+    assert registry.find_group_layout_descs("m2", 1) == {0: layout, 1: layout}
 
 
 def test_registry_attn_desc_raises_when_unregistered() -> None:
@@ -204,7 +233,7 @@ def test_registry_windows_updated_on_reregister() -> None:
 
 def test_registry_group_layout_descs_roundtrip() -> None:
     """register stores one layout per object group; find_group_layout_descs
-    reads them back in object-group order and find still returns group 0's."""
+    reads them back keyed by object group and find still returns group 0's."""
     # First Party
     from lmcache.v1.distributed.api import AttnWindowDesc, MemoryLayoutDesc
     from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
@@ -217,10 +246,10 @@ def test_registry_group_layout_descs_roundtrip() -> None:
         2,
         group0,
         attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2]),
-        group_layout_descs=[group0, group1],
+        group_layout_descs={0: group0, 1: group1},
     )
 
-    assert registry.find_group_layout_descs("m", 2) == [group0, group1]
+    assert registry.find_group_layout_descs("m", 2) == {0: group0, 1: group1}
     assert registry.find("m", 2) is group0
 
 
@@ -233,42 +262,15 @@ def test_registry_group_layout_descs_default_single_group() -> None:
     registry = LayoutDescRegistry()
     registry.register("m", 1, layout)
 
-    assert registry.find_group_layout_descs("m", 1) == [layout]
+    assert registry.find_group_layout_descs("m", 1) == {0: layout}
 
 
-def test_registry_group_layout_descs_must_cover_every_window() -> None:
-    """One layout per attention window, and group 0's layout is layout_desc."""
-    # First Party
-    from lmcache.v1.distributed.api import AttnWindowDesc, MemoryLayoutDesc
-    from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
-
-    other = MemoryLayoutDesc(shapes=[torch.Size([2, 1])], dtypes=[torch.float16])
-    registry = LayoutDescRegistry()
-    with pytest.raises(ValueError, match="object group"):
-        registry.register(
-            "m",
-            1,
-            _layout(),
-            attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2]),
-            group_layout_descs=[_layout()],
-        )
-    with pytest.raises(ValueError, match="object group"):
-        registry.register(
-            "m",
-            1,
-            _layout(),
-            attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2]),
-            group_layout_descs=[other, _layout()],
-        )
-
-
-def test_registry_group_layout_descs_raise_when_unregistered() -> None:
-    """find_group_layout_descs raises for an unknown (model, world_size) pair."""
+def test_registry_group_layout_descs_none_when_unregistered() -> None:
+    """find_group_layout_descs is None for an unknown (model, world_size) pair."""
     # First Party
     from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
 
-    with pytest.raises(ValueError, match="No layout"):
-        LayoutDescRegistry().find_group_layout_descs("missing", 1)
+    assert LayoutDescRegistry().find_group_layout_descs("missing", 1) is None
 
 
 class _FakeTwoGroupKVLayerGroupsManager(_FakeKVLayerGroupsManager):
@@ -291,7 +293,7 @@ class _FakeTwoGroupGPUContext(_FakeGPUContext):
 
 def test_gpu_registration_registers_one_layout_per_object_group(
     monkeypatch: pytest.MonkeyPatch,
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
 ) -> None:
     """Registering a hybrid KV cache records every object group's layout."""
     # First Party
@@ -344,9 +346,10 @@ def test_gpu_registration_registers_one_layout_per_object_group(
     module.register_kv_cache(1, [], "hybrid-model", 1, EngineType.VLLM, {}, [], 0)
 
     assert ctx.layout_desc_registry.find("hybrid-model", 1) is layouts[0]
-    assert ctx.layout_desc_registry.find_group_layout_descs("hybrid-model", 1) == (
-        layouts
-    )
+    assert ctx.layout_desc_registry.find_group_layout_descs("hybrid-model", 1) == {
+        0: layouts[0],
+        1: layouts[1],
+    }
 
 
 def _rank(world_size: int, worker_id: int) -> int:
@@ -434,7 +437,7 @@ def test_register_kv_cache_protocol_carries_worker_id() -> None:
 
 def test_gpu_registration_records_the_workers_kv_rank(
     monkeypatch: pytest.MonkeyPatch,
-    stub_native_storage_ops: Any,
+    stub_lmcache_native: Any,
 ) -> None:
     """Registering a KV cache records the worker's kv_rank under the pair and
     unregistering the instance releases it."""
