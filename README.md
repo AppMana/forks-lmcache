@@ -28,6 +28,37 @@
 
 </div>
 
+## AppMana fork
+
+Branch `appmana/lmcache-dsv4` is the KV connector used by
+[`AppMana/forks-vllm-consumer-nvidia-platforms`](https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms)
+to serve DeepSeek-V4-Flash and DeepSeek-V4-Flash-Vision-Exp across a
+pipeline-parallel group with a shared Redis L2. Upstream `dev` is merged
+regularly (last: `476738dd`, merged 2026-09-18); the fork's own changes are
+kept small and each carries a test:
+
+- one LMCache server per pipeline stage, all sharing Redis L2, with
+  layouts registered per KV worker rank so stages that hold different layer
+  counts and object sizes retrieve only their own objects
+  (`docs/design/v1/multiprocess/pipeline_sidecars.md`);
+- vLLM's padded `[B, H, N, C]` MLA cache views accepted as CudaIPC strided
+  views, and every RESP L2 object and L1 load buffer sized by its own object
+  group;
+- failed or incomplete retrieves answered to vLLM per request through
+  `KVConnectorTransferResults.failed_recving`, so a missing or timed-out L2
+  object is recomputed instead of raising on multi-group KV layouts;
+- multimodal cache keys that include each image's identity and placeholder
+  position, so two prompts with identical text and different images never
+  share cache entries;
+- registered workers kept alive before their first request.
+
+The vLLM fork installs this branch by commit: `docker/Dockerfile` pins
+`LMCACHE_GIT_REF` and records it in the image label
+`ai.appmana.lmcache.ref`. The DSV4 contract tests under
+`tests/v1/multiprocess/` run before every upstream update (they need a
+disposable Redis and the native extensions); the vLLM fork's `MERGING.md`
+lists the connector behaviours its merges must keep.
+
 ## Updates
 - [2026/05] 🔥 Agentic workload benchmark on AMD MI300X ([blog](https://blog.lmcache.ai/en/2026/05/12/benchmarking-lmcache-for-multi-turn-agentic-workloads-on-amd-mi300x/)).
 - [2026/04] 🔥 LMCache's new multiprocess (MP) architecture release ([blog](https://blog.lmcache.ai/en/2026/04/03/lmcaches-new-architecture-boosts-moe-inference-performance-by-10x/)).
