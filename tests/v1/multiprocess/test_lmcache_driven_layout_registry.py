@@ -428,9 +428,9 @@ def test_registry_rank_less_registration_cannot_replace_ranked_layout() -> None:
 def test_register_kv_cache_protocol_carries_worker_id() -> None:
     """REGISTER_KV_CACHE ends with the registering worker's kv worker id."""
     # First Party
-    from lmcache.v1.multiprocess.protocol import RequestType, get_payload_classes
+    from lmcache.v1.multiprocess.rpc import get_rpc_spec
 
-    payload_classes = get_payload_classes(RequestType.REGISTER_KV_CACHE)
+    payload_classes = get_rpc_spec("register_kv_cache").payload_types
     assert len(payload_classes) == 8
     assert payload_classes[7] is int
 

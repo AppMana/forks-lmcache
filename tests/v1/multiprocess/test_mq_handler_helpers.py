@@ -11,10 +11,12 @@ from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
+    IPCCacheServerKey,
     KVCache,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-from lmcache.v1.multiprocess.protocol import KeyType
+
+KeyType = IPCCacheServerKey
 
 # ==============================================================================
 # NOOP Request Handlers
@@ -42,7 +44,7 @@ def register_kv_cache_handler(
     engine_type: EngineType,
     layout_hints: LayoutHints,
     engine_group_infos: list[EngineGroupInfo],
-    worker_id: int,
+    worker_id: int = -1,
 ) -> None:
     """
     Dummy handler for REGISTER_KV_CACHE requests.

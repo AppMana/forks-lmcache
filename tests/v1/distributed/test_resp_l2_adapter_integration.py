@@ -16,13 +16,21 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+)
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
 from lmcache.v1.platform import consume_fd
+
+_MEMORY_TAGS = MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
@@ -125,7 +133,7 @@ class TestRESPL2AdapterIntegration:
         )
 
         native_client = LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 4)
-        self.adapter = NativeConnectorL2Adapter(native_client)
+        self.adapter = NativeConnectorL2Adapter(native_client, _MEMORY_TAGS)
         yield
         self.adapter.close()
         flush_redis()
@@ -343,7 +351,7 @@ class TestRESPMixedObjectSizes:
         )
 
         self.adapter = NativeConnectorL2Adapter(
-            LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 4)
+            LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 4), _MEMORY_TAGS
         )
         # One worker so every key of a batch is served over the same
         # connection, which is where a desynchronized reply would show.

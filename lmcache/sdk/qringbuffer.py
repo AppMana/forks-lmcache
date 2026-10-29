@@ -32,7 +32,7 @@ if TYPE_CHECKING:
         LoadStoreOp,
         StoreResult,
     )
-    from lmcache.v1.multiprocess.mq import MessagingFuture
+    from lmcache.v1.multiprocess.futures import MessagingFuture
     from lmcache.v1.multiprocess.transfer_context.worker_transfer import IPCEvent
 
 logger = lmcache_init_logger(__name__)
@@ -693,12 +693,12 @@ class QRingBufferAdapter:
         if not self._adapter.is_healthy:
             self.q_ring.free(ring_block_ids)
             return
-        if op.token_ids is None:
-            logger.warning("Skipping Q store for %s: token_ids is None", request_id)
+        if op.token_bytes is None:
+            logger.warning("Skipping Q store for %s: token_bytes is None", request_id)
             self.q_ring.free(ring_block_ids)
             return
         key = self._adapter._create_key(
-            op.token_ids,
+            op.token_bytes,
             op.start,
             op.end,
             request_id=request_id,
