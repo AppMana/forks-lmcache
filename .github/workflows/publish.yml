@@ -224,7 +224,7 @@ jobs:
                   path: dist
 
             - name: Upload to Test PyPI
-              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
               with:
                   repository-url: https://test.pypi.org/legacy/
                   verbose: true
@@ -258,7 +258,7 @@ jobs:
                   path: dist
 
             - name: Upload lmcache-cli to Test PyPI
-              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
               with:
                   repository-url: https://test.pypi.org/legacy/
                   verbose: true
@@ -308,7 +308,7 @@ jobs:
                   gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
 
             - name: Upload to PyPI
-              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
               with:
                 verbose: true
 
@@ -346,7 +346,7 @@ jobs:
                   gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
 
             - name: Upload lmcache-cli to PyPI
-              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
               with:
                 verbose: true
 
@@ -388,7 +388,7 @@ jobs:
                   gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
 
             - name: Upload lmcache-rust-raw-block-io to PyPI
-              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
               with:
                 verbose: true
 
